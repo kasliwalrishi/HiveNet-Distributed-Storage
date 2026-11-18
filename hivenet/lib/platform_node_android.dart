@@ -12,4 +12,22 @@ class PlatformNode {
     if (!Platform.isAndroid) return Future.value();
     return _channel.invokeMethod<void>('startNode', {'nodeId': nodeId});
   }
+
+  /// The foreground receiver persists these events, so this remains truthful
+  /// even when the Flutter activity was paused during an incoming upload.
+  static Future<List<Map<dynamic, dynamic>>> incomingTransfers() async {
+    if (!Platform.isAndroid) return const [];
+    final events = await _channel.invokeMethod<List<dynamic>>(
+      'incomingTransfers',
+    );
+    return events
+            ?.map((item) => Map<dynamic, dynamic>.from(item as Map))
+            .toList() ??
+        const [];
+  }
+
+  static Future<String> deviceName() async {
+    if (!Platform.isAndroid) return 'This device';
+    return await _channel.invokeMethod<String>('deviceName') ?? 'This device';
+  }
 }

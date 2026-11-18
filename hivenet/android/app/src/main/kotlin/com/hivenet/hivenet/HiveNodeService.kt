@@ -4,8 +4,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
+import android.content.Context
 import android.os.Build
 import android.os.IBinder
+import android.util.Base64
 import androidx.core.app.NotificationCompat
 import org.json.JSONArray
 import org.json.JSONObject
@@ -19,6 +21,33 @@ import java.util.concurrent.Executors
 
 /** A small dependency-free HTTP server. It owns the on-device replica files. */
 class HiveNodeService : Service() {
+    companion object {
+        private const val transferKey = "incomingTransfers"
+
+        /** A small persisted event feed for Flutter. No event is invented: each
+         * transition is written from the HTTP receiver while it handles bytes. */
+        fun incomingTransfers(context: Context): List<Map<String, Any?>> {
+            val raw = context.getSharedPreferences("hivenet", Context.MODE_PRIVATE)
+                .getString(transferKey, "[]") ?: "[]"
+            return try {
+                val array = JSONArray(raw)
+                (0 until array.length()).map { index ->
+                    val item = array.getJSONObject(index)
+                    mapOf<String, Any?>(
+                        "id" to item.optString("id"),
+                        "sender" to item.optString("sender", "Unknown device"),
+                        "originalName" to item.optString("originalName", "image.jpg"),
+                        "storedName" to item.optString("storedName", "encryptedImage"),
+                        "receivedBytes" to item.optLong("receivedBytes"),
+                        "totalBytes" to item.optLong("totalBytes"),
+                        "stage" to item.optString("stage", "Incoming"),
+                        "updatedAt" to item.optLong("updatedAt"),
+                        "error" to item.optString("error").takeIf { it.isNotEmpty() },
+                    )
+                }
+            } catch (_: Exception) { emptyList() }
+        }
+    }
     private val port = 8765
     @Volatile private var running = false
     private var server: ServerSocket? = null
@@ -113,25 +142,57 @@ class HiveNodeService : Service() {
         val deleteHash = r.headers["x-hivenet-delete-token-hash"]
             ?: return response(out, 400, "application/json", "{\"error\":\"missing delete capability\"}".toByteArray())
         if (!deleteHash.matches(Regex("[a-f0-9]{64}"))) return response(out, 400, "application/json", ByteArray(0))
-        val dir = File(root, "files").also { it.mkdirs() }; val tmp = File(dir, "$id.part"); val digest = MessageDigest.getInstance("SHA-256")
+        val dir = File(root, "files").also { it.mkdirs() }
+        val originalName = decodedHeader(r.headers["x-hivenet-name-b64"], r.headers["x-hivenet-name"] ?: "image.jpg")
+        val sender = decodedHeader(r.headers["x-hivenet-sender-b64"], r.headers["x-hivenet-sender"] ?: "Unknown device")
+        // The sender supplies a content-derived opaque name. It never contains
+        // the gallery filename, and the receiver rejects unsafe filesystem names.
+        val storedName = (r.headers["x-hivenet-stored-name"] ?: "encryptedImage_${id.take(12)}")
+            .takeIf { it.matches(Regex("encryptedImage_[a-zA-Z0-9_-]{4,80}")) }
+            ?: "encryptedImage_${id.take(12)}"
+        val tmp = File(dir, "$storedName.part"); val digest = MessageDigest.getInstance("SHA-256")
+        transfer(id, sender, originalName, storedName, 0, length, "Incoming")
         FileOutputStream(tmp).use { file ->
             var remaining = length; val buffer = ByteArray(32 * 1024)
-            while (remaining > 0) { val count = input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt()); if (count < 0) throw EOFException(); file.write(buffer, 0, count); digest.update(buffer, 0, count); remaining -= count }
+            while (remaining > 0) {
+                val count = input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
+                if (count < 0) {
+                    transfer(id, sender, originalName, storedName, length - remaining, length, "Failed", "Connection ended before all bytes arrived")
+                    throw EOFException()
+                }
+                file.write(buffer, 0, count); digest.update(buffer, 0, count); remaining -= count
+                transfer(id, sender, originalName, storedName, length - remaining, length, "Receiving")
+            }
             file.fd.sync()
         }
+        transfer(id, sender, originalName, storedName, length, length, "Verifying")
         val actual = digest.digest().joinToString("") { "%02x".format(it) }
-        if (actual != expected.lowercase()) { tmp.delete(); return response(out, 422, "application/json", "{\"error\":\"checksum mismatch\"}".toByteArray()) }
-        val target = File(dir, "$id.jpg"); if (!tmp.renameTo(target)) { tmp.copyTo(target, true); tmp.delete() }
-        val name = URLDecoder.decode(r.headers["x-hivenet-name"] ?: "image.jpg", "UTF-8")
-        File(dir, "$id.json").writeText(JSONObject().put("id", id).put("name", "encrypted-object").put("mime", "application/octet-stream").put("sha256", actual).put("bytes", length).put("originalBytes", r.headers["x-hivenet-original-bytes"]?.toLongOrNull() ?: length).put("deleteTokenHash", deleteHash).put("createdAt", System.currentTimeMillis()).toString())
+        if (actual != expected.lowercase()) { tmp.delete(); transfer(id, sender, originalName, storedName, length, length, "Failed", "Checksum mismatch"); return response(out, 422, "application/json", "{\"error\":\"checksum mismatch\"}".toByteArray()) }
+        val target = File(dir, "$storedName.bin"); if (!tmp.renameTo(target)) { tmp.copyTo(target, true); tmp.delete() }
+        File(dir, "$id.json").writeText(JSONObject().put("id", id).put("name", originalName).put("storedName", storedName).put("mime", "application/octet-stream").put("sha256", actual).put("bytes", length).put("originalBytes", r.headers["x-hivenet-original-bytes"]?.toLongOrNull() ?: length).put("deleteTokenHash", deleteHash).put("createdAt", System.currentTimeMillis()).toString())
+        transfer(id, sender, originalName, storedName, length, length, "Stored Successfully")
         response(out, 201, "application/json", JSONObject().put("stored", true).put("id", id).put("sha256", actual).toString().toByteArray())
     }
+    private fun transfer(id: String, sender: String, originalName: String, storedName: String, receivedBytes: Long, totalBytes: Long, stage: String, error: String? = null) {
+        val prefs = getSharedPreferences("hivenet", MODE_PRIVATE)
+        val events = try { JSONArray(prefs.getString(transferKey, "[]")) } catch (_: Exception) { JSONArray() }
+        val item = JSONObject().put("id", id).put("sender", sender).put("originalName", originalName).put("storedName", storedName).put("receivedBytes", receivedBytes).put("totalBytes", totalBytes).put("stage", stage).put("updatedAt", System.currentTimeMillis())
+        if (error != null) item.put("error", error)
+        var replaced = false
+        for (index in 0 until events.length()) if (events.getJSONObject(index).optString("id") == id) { events.put(index, item); replaced = true; break }
+        if (!replaced) events.put(item)
+        while (events.length() > 12) events.remove(0)
+        prefs.edit().putString(transferKey, events.toString()).apply()
+    }
+    private fun decodedHeader(encoded: String?, fallback: String): String = try {
+        if (encoded == null) URLDecoder.decode(fallback, "UTF-8") else String(Base64.decode(encoded, Base64.URL_SAFE or Base64.NO_WRAP), Charsets.UTF_8)
+    } catch (_: Exception) { fallback }
     private fun info(out: OutputStream) = response(out, 200, "application/json", JSONObject().put("nodeId", nodeId).put("port", port).put("freeBytes", root.usableSpace).toString().toByteArray())
     private fun listFiles(out: OutputStream) {
         val a = JSONArray(); File(root, "files").listFiles { f -> f.extension == "json" }?.forEach { a.put(JSONObject(it.readText())) }; response(out, 200, "application/json", a.toString().toByteArray())
     }
     private fun meta(out: OutputStream, id: String) { val f = File(root, "files/$id.json"); if (!f.exists()) response(out, 404, "application/json", ByteArray(0)) else response(out, 200, "application/json", f.readBytes()) }
-    private fun download(out: OutputStream, id: String) { val f = File(root, "files/$id.jpg"); if (!f.exists()) response(out, 404, "application/json", ByteArray(0)) else response(out, 200, "image/jpeg", f.readBytes()) }
+    private fun download(out: OutputStream, id: String) { val metadata = File(root, "files/$id.json"); val stored = if (metadata.exists()) JSONObject(metadata.readText()).optString("storedName", "encryptedImage_${id.take(12)}") else ""; val current = File(root, "files/$stored.bin"); val legacy = File(root, "files/$id.jpg"); val f = if (current.exists()) current else legacy; if (!f.exists()) response(out, 404, "application/json", ByteArray(0)) else response(out, 200, "application/octet-stream", f.readBytes()) }
     private fun delete(out: OutputStream, r: Request, id: String) {
         if (!id.matches(Regex("[a-f0-9]{64}"))) return response(out, 400, "application/json", ByteArray(0))
         val metadata = File(root, "files/$id.json")
@@ -140,14 +201,15 @@ class HiveNodeService : Service() {
         val expected = JSONObject(metadata.readText()).optString("deleteTokenHash")
         val actual = MessageDigest.getInstance("SHA-256").digest(supplied.toByteArray()).joinToString("") { "%02x".format(it) }
         if (expected != actual) return response(out, 403, "application/json", ByteArray(0))
-        File(root, "files/$id.jpg").delete(); metadata.delete(); File(root, "files/$id.part").delete()
+        val stored = JSONObject(metadata.readText()).optString("storedName", "encryptedImage_${id.take(12)}")
+        File(root, "files/$stored.bin").delete(); File(root, "files/$id.jpg").delete(); metadata.delete(); File(root, "files/$stored.part").delete(); File(root, "files/$id.part").delete()
         response(out, 200, "application/json", "{\"deleted\":true,\"id\":\"$id\"}".toByteArray())
     }
     private fun idFromPath(path: String) = path.removePrefix("/v1/files/").removeSuffix("/meta")
     // Chrome's Local Network Access / Private Network Access preflight asks
     // for this explicit opt-in before a public page may contact a LAN peer.
     // Older browsers safely ignore the extra CORS response header.
-    private fun corsPreflight(out: OutputStream) { out.write("HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, PUT, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, X-HiveNet-Sha256, X-HiveNet-Name, X-HiveNet-Mime, X-HiveNet-Original-Bytes, X-HiveNet-Delete-Token-Hash, X-HiveNet-Delete-Token\r\nAccess-Control-Allow-Private-Network: true\r\nAccess-Control-Max-Age: 600\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray()); out.flush() }
+    private fun corsPreflight(out: OutputStream) { out.write("HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, PUT, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, X-HiveNet-Sha256, X-HiveNet-Name, X-HiveNet-Name-B64, X-HiveNet-Mime, X-HiveNet-Original-Bytes, X-HiveNet-Delete-Token-Hash, X-HiveNet-Delete-Token, X-HiveNet-Sender, X-HiveNet-Sender-B64, X-HiveNet-Stored-Name\r\nAccess-Control-Allow-Private-Network: true\r\nAccess-Control-Max-Age: 600\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray()); out.flush() }
     private fun response(out: OutputStream, status: Int, type: String, body: ByteArray) { val text = if (status in 200..299) "OK" else "Error"; out.write("HTTP/1.1 $status $text\r\nContent-Type: $type\r\nContent-Length: ${body.size}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Private-Network: true\r\nConnection: close\r\n\r\n".toByteArray()); out.write(body); out.flush() }
     override fun onDestroy() { running = false; server?.close(); workers.shutdownNow(); super.onDestroy() }
     override fun onBind(intent: Intent?): IBinder? = null

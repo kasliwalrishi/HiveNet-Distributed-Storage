@@ -30,6 +30,10 @@ class MainActivity : FlutterActivity() {
                         }
                     }
                     "stopNode" -> { stopService(Intent(this, HiveNodeService::class.java)); result.success(true) }
+                    "incomingTransfers" -> {
+                        result.success(HiveNodeService.incomingTransfers(this))
+                    }
+                    "deviceName" -> result.success("${Build.MANUFACTURER} ${Build.MODEL}")
                     else -> result.notImplemented()
                 }
             }

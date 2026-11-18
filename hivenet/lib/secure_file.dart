@@ -29,12 +29,18 @@ class OwnerVault {
   final FlutterSecureStorage _storage;
   final _cipher = AesGcm.with256bits();
 
-  Future<EncryptedFile> encrypt(List<int> plaintext) async {
+  Future<EncryptedFile> encrypt(
+    List<int> plaintext, {
+    void Function()? onHashing,
+  }) async {
     final key = await _cipher.newSecretKey();
     final keyBytes = await key.extractBytes();
     final nonce = _cipher.newNonce();
     final box = await _cipher.encrypt(plaintext, secretKey: key, nonce: nonce);
     final bytes = Uint8List.fromList([...box.cipherText, ...box.mac.bytes]);
+    // The caller may now accurately announce hashing: cipher creation is done
+    // and the SHA-256 identity calculation starts at this exact point.
+    onHashing?.call();
     final id = sha256.convert(bytes).toString();
     final token = base64Url.encode(
       List<int>.generate(32, (_) => Random.secure().nextInt(256)),

@@ -1,5 +1,6 @@
 // ignore_for_file: deprecated_member_use
 import 'dart:convert';
+import 'dart:async';
 import 'dart:math';
 import 'dart:ui';
 
@@ -9,11 +10,13 @@ import 'package:hive_flutter/hive_flutter.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter/services.dart';
 
 import 'hive_core.dart';
 import 'platform_node.dart';
 import 'secure_file.dart';
 import 'ui/hivenet_ui.dart';
+import 'transfer_experience.dart';
 
 const _port = 8765;
 final themeMode = ValueNotifier(ThemeMode.dark);
@@ -194,8 +197,12 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
   final activity = <ActivityEvent>[];
   int tab = 0;
   var nodeId = '';
+  var deviceName = 'This device';
   var busy = true;
   var status = 'Starting node...';
+  UploadExperience? uploadExperience;
+  List<IncomingTransfer> incomingTransfers = const [];
+  Timer? _incomingPoll;
 
   // Background gradient animation controller
   late final AnimationController _bgAnimationController;
@@ -232,6 +239,10 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
         });
       }
     });
+    _incomingPoll = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) => _loadIncomingTransfers(),
+    );
   }
 
   @override
@@ -239,6 +250,7 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
     _bgAnimationController.dispose();
     _storageRingCtrl.dispose();
     _routerAnimCtrl.dispose();
+    _incomingPoll?.cancel();
     super.dispose();
   }
 
@@ -264,6 +276,7 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
     );
     nodeId = prefs.getString('node') ?? randomId();
     await prefs.setString('node', nodeId);
+    deviceName = await PlatformNode.deviceName();
     for (final saved
         in (jsonDecode(prefs.getString('peers') ?? '[]') as List)) {
       // Accept the old string-only peer list while retaining real transfer
@@ -279,7 +292,51 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
     // A foreground receiver is native because a Flutter activity may be
     // paused or destroyed while another LAN node uploads a replica.
     await PlatformNode.start(nodeId);
+    await _loadIncomingTransfers();
     await refresh();
+  }
+
+  Future<void> _loadIncomingTransfers() async {
+    final raw = await PlatformNode.incomingTransfers();
+    final next = raw.map(IncomingTransfer.fromPlatform).toList()
+      ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    if (!mounted) return;
+    // Avoid rebuilding each second when nothing changed.
+    if (next.length == incomingTransfers.length &&
+        next.every(
+          (item) => incomingTransfers.any(
+            (old) =>
+                old.id == item.id &&
+                old.stage == item.stage &&
+                old.receivedBytes == item.receivedBytes,
+          ),
+        )) {
+      return;
+    }
+    final wasComplete = incomingTransfers
+        .where((e) => e.complete)
+        .map((e) => e.id)
+        .toSet();
+    setState(() => incomingTransfers = next);
+    if (next.any((item) => item.complete && !wasComplete.contains(item.id))) {
+      HapticFeedback.heavyImpact();
+    }
+  }
+
+  void _setUpload(UploadExperience value) {
+    if (!mounted) return;
+    final prior = uploadExperience?.stage;
+    setState(() {
+      uploadExperience = value;
+      status = value.message;
+    });
+    if (prior != value.stage &&
+        (value.stage == TransferStage.complete ||
+            value.stage == TransferStage.failed)) {
+      HapticFeedback.mediumImpact();
+    } else if (prior != value.stage) {
+      HapticFeedback.selectionClick();
+    }
   }
 
   Future<void> savePeers() async {
@@ -431,7 +488,9 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
   Future<bool> send(
     Peer peer,
     String id,
-    String name,
+    String originalName,
+    String storedName,
+    int originalBytes,
     EncryptedFile image,
   ) async {
     try {
@@ -442,9 +501,13 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
             headers: {
               'Content-Type': 'application/octet-stream',
               'x-hivenet-sha256': id,
-              'x-hivenet-name': 'encrypted-object',
+              // Gallery filename and opaque storage filename are separate.
+              // The receiving node persists only [storedName] to its filesystem.
+              'x-hivenet-name-b64': base64Url.encode(utf8.encode(originalName)),
+              'x-hivenet-stored-name': storedName,
+              'x-hivenet-sender-b64': base64Url.encode(utf8.encode(deviceName)),
               'x-hivenet-mime': 'application/octet-stream',
-              'x-hivenet-original-bytes': '${image.ciphertext.length}',
+              'x-hivenet-original-bytes': '$originalBytes',
               'x-hivenet-delete-token-hash': image.deleteTokenHash,
             },
           )
@@ -460,15 +523,53 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
   Future<void> upload() async {
     final selected = await picker.pickImage(source: ImageSource.gallery);
     if (selected == null) return;
+    final source = await selected.readAsBytes();
+    _setUpload(
+      UploadExperience(
+        stage: TransferStage.selected,
+        message: 'Preview ready. Preparing this image on your device.',
+        originalName: selected.name,
+        preview: source,
+      ),
+    );
+    // Give the selected state a frame before starting the real CPU work.
+    await Future<void>.delayed(Duration.zero);
     setState(() {
       busy = true;
       status = 'Compressing image...';
     });
     try {
-      final prepared = compressImage(await selected.readAsBytes());
-      setState(() => status = 'Encrypting locally with AES-256-GCM...');
-      final encrypted = await vault.encrypt(prepared.bytes);
+      _setUpload(
+        UploadExperience(
+          stage: TransferStage.compressing,
+          message: 'Compressing image locally.',
+          originalName: selected.name,
+          preview: source,
+        ),
+      );
+      final prepared = compressImage(source);
+      _setUpload(
+        UploadExperience(
+          stage: TransferStage.encrypting,
+          message: 'Encrypting locally with AES-256-GCM.',
+          originalName: selected.name,
+          preview: source,
+        ),
+      );
+      final encrypted = await vault.encrypt(
+        prepared.bytes,
+        onHashing: () => _setUpload(
+          UploadExperience(
+            stage: TransferStage.hashing,
+            message:
+                'Generating the SHA-256 identity for the encrypted object.',
+            originalName: selected.name,
+            preview: source,
+          ),
+        ),
+      );
       final id = encrypted.id;
+      final storedName = 'encryptedImage_${id.substring(0, 12)}';
       lastCompression =
           '${size(prepared.originalBytes)} → ${size(prepared.bytes.length)} '
           '(${((1 - prepared.ratio) * 100).toStringAsFixed(0)}% smaller, '
@@ -481,20 +582,74 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
         successes: peer.successes,
         failures: peer.failures,
       );
+      _setUpload(
+        UploadExperience(
+          stage: TransferStage.discovering,
+          message: 'Evaluating live capacity, latency, and verified-transfer history.',
+          originalName: selected.name,
+          storedName: storedName,
+          sha256: id,
+          preview: source,
+        ),
+      );
       // Router only considers responsive peers with enough real free space.
-      if (selectReplicaPeers(
-            peers,
-            candidate,
-            encrypted.ciphertext.length,
-          ).length !=
-          2) {
+      final ranked = selectReplicaPeers(
+        peers,
+        candidate,
+        encrypted.ciphertext.length,
+      );
+      if (ranked.length != 2) {
         throw Exception('Exactly two distinct eligible peers are required.');
       }
-      setState(() => status = 'Replicating to two storage nodes...');
+      List<TransferPeerView> peerViews(
+        List<Peer> selection, {
+        Peer? active,
+        Set<String> verified = const {},
+        Set<String> failed = const {},
+      }) => selection.asMap().entries.map((entry) {
+        final peer = entry.value;
+        final peerStatus = verified.contains(peer.key)
+            ? 'Replica stored and SHA-256 verified'
+            : failed.contains(peer.key)
+            ? 'Transfer failed; evaluating next eligible peer'
+            : active?.key == peer.key
+            ? 'Network transfer in progress'
+            : 'Queued for verified replication';
+        return TransferPeerView(
+          name: peer.id ?? peer.host,
+          rank: entry.key == 0 ? 'BEST REPLICA' : 'SECOND REPLICA',
+          availableStorage: size(peer.free),
+          latency: '${peer.latencyMs ?? '?'} ms',
+          reliability:
+              '${(peer.reliability * 100).toStringAsFixed(0)}% reliable',
+          status: peerStatus,
+        );
+      }).toList();
+      _setUpload(
+        UploadExperience(
+          stage: TransferStage.selecting,
+          message: 'Two distinct storage devices were selected.',
+          originalName: selected.name,
+          storedName: storedName,
+          sha256: id,
+          preview: source,
+          peers: peerViews(ranked),
+        ),
+      );
       // A failed top-ranked device is replaced by the next ranked *distinct*
       // peer; a successful transfer is never faked or counted twice.
       final attemptedKeys = <String>{};
       final replicas = <Peer>[];
+      List<Peer> displayPeers(Peer active) {
+        final seen = <String>{};
+        return [
+          ...replicas,
+          active,
+          ...ranked,
+          ...peers,
+        ].where((candidate) => seen.add(candidate.key)).take(2).toList();
+      }
+
       while (replicas.length < 2) {
         final next = selectReplicaPeers(
           peers.where((peer) => !attemptedKeys.contains(peer.key)),
@@ -504,7 +659,49 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
         if (next.isEmpty) break;
         final peer = next.first;
         attemptedKeys.add(peer.key);
-        if (await send(peer, id, selected.name, encrypted)) {
+        _setUpload(
+          UploadExperience(
+            stage: TransferStage.sending,
+            message: 'Sending encrypted data to ${peer.id ?? peer.host}.',
+            originalName: selected.name,
+            storedName: storedName,
+            sha256: id,
+            preview: source,
+            peers: peerViews(
+              displayPeers(peer),
+              active: peer,
+              verified: replicas.map((item) => item.key).toSet(),
+            ),
+          ),
+        );
+        final stored = await send(
+          peer,
+          id,
+          selected.name,
+          storedName,
+          prepared.originalBytes,
+          encrypted,
+        );
+        _setUpload(
+          UploadExperience(
+            stage: TransferStage.verifying,
+            message: stored
+                ? 'Verifying ${peer.id ?? peer.host} acknowledgement.'
+                : 'Transfer to ${peer.id ?? peer.host} failed; evaluating another peer.',
+            originalName: selected.name,
+            storedName: storedName,
+            sha256: id,
+            preview: source,
+            peers: peerViews(
+              displayPeers(peer),
+              verified: stored
+                  ? {...replicas.map((item) => item.key), peer.key}
+                  : replicas.map((item) => item.key).toSet(),
+              failed: stored ? const {} : {peer.key},
+            ),
+          ),
+        );
+        if (stored) {
           peer.successes++;
           replicas.add(peer);
         } else {
@@ -523,6 +720,7 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
       }
       ownerRecords[id] = {
         'name': selected.name,
+        'storedName': storedName,
         'nonce': base64Url.encode(encrypted.nonce),
         'bytes': prepared.bytes.length,
         'originalBytes': prepared.originalBytes,
@@ -550,9 +748,32 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
             content: Text('Replicated and verified on both storage nodes.'),
           ),
         );
+        _setUpload(
+          UploadExperience(
+            stage: TransferStage.complete,
+            message: 'Both independent replicas are stored and verified.',
+            originalName: selected.name,
+            storedName: storedName,
+            sha256: id,
+            preview: source,
+            peers: peerViews(
+              replicas,
+              verified: replicas.map((item) => item.key).toSet(),
+            ),
+          ),
+        );
       }
     } catch (e) {
       log('Upload failed', '$e', Icons.error_outline, error: true);
+      _setUpload(
+        UploadExperience(
+          stage: TransferStage.failed,
+          message: 'No successful result was reported.',
+          originalName: selected.name,
+          preview: source,
+          error: '$e',
+        ),
+      );
       if (mounted) {
         ScaffoldMessenger.of(context)
             .showSnackBar(SnackBar(content: Text('Upload failed: $e')));
@@ -854,6 +1075,20 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
                         ],
                       ),
                     ),
+                    if (incomingTransfers.isNotEmpty) ...[
+                      NeonSectionTitle('Incoming replicas', color: kAmber),
+                      ...incomingTransfers
+                          .take(3)
+                          .map(
+                            (transfer) => Padding(
+                              padding: const EdgeInsets.only(bottom: 10),
+                              child: IncomingTransferCard(
+                                transfer: transfer,
+                                formatSize: size,
+                              ),
+                            ),
+                          ),
+                    ],
                     const SizedBox(height: 16),
 
                     // ── Metric cards row ──
@@ -1018,8 +1253,9 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
             ],
           ),
 
-          // ── Upload busy overlay ──
-          if (busy) _uploadOverlay(c),
+          // Only genuine upload events open the transfer experience. A refresh
+          // cannot be mistaken for a successful transfer.
+          if (uploadExperience != null) _uploadOverlay(c),
         ],
       ),
 
@@ -1159,18 +1395,22 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
     );
   }
 
-  /// Full-screen upload overlay with HiveUploadAnimation
+  /// Full-screen, event-driven upload experience.
   Widget _uploadOverlay(BuildContext c) {
-    return AnimatedOpacity(
-      duration: const Duration(milliseconds: 300),
-      opacity: busy ? 1.0 : 0.0,
-      child: IgnorePointer(
-        ignoring: !busy,
-        child: Container(
-          color: Colors.black.withOpacity(0.75),
-          child: Center(child: HiveUploadAnimation(statusText: status)),
-        ),
-      ),
+    final experience = uploadExperience!;
+    return TransferExperienceSheet(
+      key: ValueKey('${experience.stage}-${experience.message}'),
+      experience: experience,
+      formatSize: size,
+      onClose: experience.isFinished
+          ? () => setState(() => uploadExperience = null)
+          : null,
+      onRetry: experience.stage == TransferStage.failed
+          ? () {
+              setState(() => uploadExperience = null);
+              upload();
+            }
+          : null,
     );
   }
 
