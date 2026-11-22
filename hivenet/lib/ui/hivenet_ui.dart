@@ -18,6 +18,7 @@ const kRed = Color(0xffC87070); // error state
 const kDarkBg = Color(0xff0A1218);
 const kDarkSurface = Color(0xff121E26);
 const kGlass = Color(0x1FFFFFFF); // 12% white
+const kNeonTurquoise = Color(0xff20E6D0);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GlassCard  (replaces HnCard)
@@ -420,6 +421,443 @@ class _ShimmerBoxState extends State<ShimmerBox>
       },
     );
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PressScale
+// ─────────────────────────────────────────────────────────────────────────────
+/// A small, reusable pressed-state response for controls throughout the app.
+/// [Listener] keeps the child button's own semantics, keyboard actions, and
+/// splash behaviour intact.
+class PressScale extends StatefulWidget {
+  const PressScale({super.key, required this.child, this.enabled = true});
+
+  final Widget child;
+  final bool enabled;
+
+  @override
+  State<PressScale> createState() => _PressScaleState();
+}
+
+class _PressScaleState extends State<PressScale> {
+  bool _pressed = false;
+
+  void _setPressed(bool value) {
+    if (!widget.enabled || _pressed == value) return;
+    setState(() => _pressed = value);
+  }
+
+  @override
+  Widget build(BuildContext context) => Listener(
+    onPointerDown: (_) => _setPressed(true),
+    onPointerUp: (_) => _setPressed(false),
+    onPointerCancel: (_) => _setPressed(false),
+    child: AnimatedScale(
+      scale: _pressed ? 0.975 : 1,
+      duration: const Duration(milliseconds: 110),
+      curve: Curves.easeOutCubic,
+      child: widget.child,
+    ),
+  );
+}
+
+/// A calm focus and typing response used by the profile-registration form.
+class AnimatedRegistrationField extends StatefulWidget {
+  const AnimatedRegistrationField({
+    super.key,
+    required this.controller,
+    required this.labelText,
+    required this.hintText,
+    this.leadingIcon,
+  });
+
+  final TextEditingController controller;
+  final String labelText;
+  final String hintText;
+  final IconData? leadingIcon;
+
+  @override
+  State<AnimatedRegistrationField> createState() =>
+      _AnimatedRegistrationFieldState();
+}
+
+class _AnimatedRegistrationFieldState extends State<AnimatedRegistrationField> {
+  final FocusNode _focusNode = FocusNode();
+
+  @override
+  void initState() {
+    super.initState();
+    _focusNode.addListener(_refresh);
+    widget.controller.addListener(_refresh);
+  }
+
+  @override
+  void didUpdateWidget(covariant AnimatedRegistrationField oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      oldWidget.controller.removeListener(_refresh);
+      widget.controller.addListener(_refresh);
+    }
+  }
+
+  void _refresh() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _focusNode
+      ..removeListener(_refresh)
+      ..dispose();
+    widget.controller.removeListener(_refresh);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final focused = _focusNode.hasFocus;
+    final filled = widget.controller.text.trim().isNotEmpty;
+    return AnimatedScale(
+      duration: const Duration(milliseconds: 170),
+      curve: Curves.easeOutCubic,
+      scale: focused ? 1.01 : 1,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOutCubic,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(16),
+          boxShadow: focused
+              ? [
+                  BoxShadow(
+                    color: kCyan.withOpacity(.18),
+                    blurRadius: 16,
+                    spreadRadius: -5,
+                  ),
+                ]
+              : const [],
+        ),
+        child: TextField(
+          controller: widget.controller,
+          focusNode: _focusNode,
+          textCapitalization: TextCapitalization.words,
+          decoration: InputDecoration(
+            labelText: widget.labelText,
+            hintText: widget.hintText,
+            prefixIcon: widget.leadingIcon == null
+                ? null
+                : Icon(widget.leadingIcon, color: focused ? kCyan : null),
+            suffixIcon: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 180),
+              child: filled
+                  ? const Icon(Icons.check_circle_rounded, color: kCyan)
+                  : null,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// A full-screen startup surface used while HiveNet restores its local node.
+class HiveNetworkSplashScreen extends StatelessWidget {
+  const HiveNetworkSplashScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final logoWidth = math.min(MediaQuery.sizeOf(context).width * .96, 470.0);
+    return Scaffold(
+      backgroundColor: kDarkBg,
+      body: DecoratedBox(
+        decoration: const BoxDecoration(
+          gradient: RadialGradient(
+            center: Alignment(0, -.45),
+            radius: 1.18,
+            colors: [Color(0xff123B3C), Color(0xff07171A), kDarkBg],
+            stops: [0, .48, 1],
+          ),
+        ),
+        child: Center(
+          child: Semantics(
+            label: 'HiveNet is connecting',
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: logoWidth,
+                  child: const RegistrationBrandMark(),
+                ),
+                const SizedBox(height: 30),
+                const Text(
+                  'Establishing your private network',
+                  style: TextStyle(
+                    color: Colors.white70,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: .15,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// A responsive, native Flutter version of the registration logo.  The
+/// launcher asset is intentionally not used here: it is a square composite
+/// image, while this is a wide lockup whose single logo arc drives the dot.
+class RegistrationBrandMark extends StatefulWidget {
+  const RegistrationBrandMark({super.key});
+
+  @override
+  State<RegistrationBrandMark> createState() => _RegistrationBrandMarkState();
+}
+
+class _RegistrationBrandMarkState extends State<RegistrationBrandMark>
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
+  late final AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 2300),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _controller.repeat();
+    } else if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      _controller.stop();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) {
+      final contentWidth = constraints.maxWidth.isFinite
+          ? constraints.maxWidth
+          : MediaQuery.sizeOf(context).width;
+      final logoWidth = contentWidth * .90;
+      return Semantics(
+        label: 'HiveNet',
+        child: Center(
+          child: RepaintBoundary(
+            child: SizedBox(
+              width: logoWidth,
+              height: logoWidth * .78,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  CustomPaint(painter: const _RegistrationLogoPainter()),
+                  CustomPaint(
+                    painter: _RegistrationLogoDotPainter(_controller),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    },
+  );
+}
+
+/// This geometry mirrors the internal arc and honeycomb proportions in the
+/// supplied HiveNet artwork. Both painters read the same arc path, preventing
+/// a second ring or an independently positioned orbit from appearing.
+class _RegistrationLogoGeometry {
+  const _RegistrationLogoGeometry(this.size);
+
+  final Size size;
+
+  double get unit => size.width;
+
+  Path get arc => Path()
+    ..addArc(
+      Rect.fromLTWH(unit * .115, unit * .135, unit * .76, unit),
+      math.pi,
+      math.pi,
+    );
+
+  double get hexRadius => unit * .108;
+
+  Offset get topHexCenter => Offset(unit * .50, unit * .335);
+
+  Offset get leftHexCenter => Offset(unit * .406, unit * .497);
+
+  Offset get rightHexCenter => Offset(unit * .594, unit * .497);
+
+  Path hexagon(Offset center) {
+    final path = Path();
+    for (var index = 0; index < 6; index++) {
+      final angle = -math.pi / 2 + index * math.pi / 3;
+      final point = Offset(
+        center.dx + hexRadius * math.cos(angle),
+        center.dy + hexRadius * math.sin(angle),
+      );
+      if (index == 0) {
+        path.moveTo(point.dx, point.dy);
+      } else {
+        path.lineTo(point.dx, point.dy);
+      }
+    }
+    return path..close();
+  }
+}
+
+class _RegistrationLogoPainter extends CustomPainter {
+  const _RegistrationLogoPainter();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final geometry = _RegistrationLogoGeometry(size);
+    final arc = geometry.arc;
+    // This is the original logo's one and only semicircular arc.
+    canvas.drawPath(
+      arc,
+      Paint()
+        ..color = kNeonTurquoise.withOpacity(.16)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 5
+        ..strokeCap = StrokeCap.round
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 7),
+    );
+    canvas.drawPath(
+      arc,
+      Paint()
+        ..color = kNeonTurquoise.withOpacity(.72)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.2
+        ..strokeCap = StrokeCap.round,
+    );
+
+    final symbolBounds = Rect.fromCenter(
+      center: Offset(size.width / 2, size.height * .45),
+      width: size.width * .52,
+      height: size.height * .52,
+    );
+    final glowPaint = Paint()
+      ..color = kNeonTurquoise.withOpacity(.24)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = math.max(5, size.width * .031)
+      ..strokeJoin = StrokeJoin.round
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 8);
+    final symbolPaint = Paint()
+      ..shader = const LinearGradient(
+        begin: Alignment.topLeft,
+        end: Alignment.bottomRight,
+        colors: [Color(0xffAAFFF8), kNeonTurquoise, Color(0xff00B8AF)],
+      ).createShader(symbolBounds)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = math.max(3.2, size.width * .019)
+      ..strokeJoin = StrokeJoin.round;
+    for (final center in [
+      geometry.topHexCenter,
+      geometry.leftHexCenter,
+      geometry.rightHexCenter,
+    ]) {
+      final hexagon = geometry.hexagon(center);
+      canvas.drawPath(hexagon, glowPaint);
+      canvas.drawPath(hexagon, symbolPaint);
+    }
+
+    final wordmark = TextPainter(
+      text: TextSpan(
+        text: 'HiveNet',
+        style: TextStyle(
+          color: const Color(0xffF4FFFE),
+          fontFamily: 'sans-serif',
+          fontSize: geometry.unit * .115,
+          fontStyle: FontStyle.italic,
+          fontWeight: FontWeight.w800,
+          letterSpacing: -geometry.unit * .006,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+      maxLines: 1,
+    )..layout();
+    wordmark.paint(
+      canvas,
+      Offset((size.width - wordmark.width) / 2, geometry.unit * .635),
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _RegistrationLogoPainter oldDelegate) => false;
+}
+
+class _RegistrationLogoDotPainter extends CustomPainter {
+  _RegistrationLogoDotPainter(this.progress) : super(repaint: progress);
+
+  final Animation<double> progress;
+
+  Offset _positionFor(double value, PathMetric metric) {
+    final eased = Curves.easeInOutCubic.transform(value);
+    return metric.getTangentForOffset(metric.length * eased)!.position;
+  }
+
+  double _visibility(double value) =>
+      (math.sin(math.pi * value) / .32).clamp(0.0, 1.0);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final value = progress.value;
+    final visibility = _visibility(value);
+    if (visibility == 0) return;
+    final metric = _RegistrationLogoGeometry(size).arc.computeMetrics().first;
+
+    // A short, quiet trail fades along the same path behind the node.
+    for (var index = 11; index >= 1; index--) {
+      final trailingValue = value - index * .018;
+      if (trailingValue <= 0) continue;
+      canvas.drawCircle(
+        _positionFor(trailingValue, metric),
+        1 + (11 - index) * .08,
+        Paint()
+          ..color = kNeonTurquoise.withOpacity(
+            visibility * (1 - index / 12) * .22,
+          ),
+      );
+    }
+
+    final position = _positionFor(value, metric);
+    canvas.drawCircle(
+      position,
+      8,
+      Paint()
+        ..color = kNeonTurquoise.withOpacity(visibility * .44)
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 8),
+    );
+    canvas.drawCircle(
+      position,
+      4,
+      Paint()
+        ..color = kNeonTurquoise.withOpacity(visibility)
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 2),
+    );
+    canvas.drawCircle(position, 2.2, Paint()..color = Colors.white);
+  }
+
+  @override
+  bool shouldRepaint(covariant _RegistrationLogoDotPainter oldDelegate) =>
+      false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

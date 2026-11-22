@@ -1,5 +1,6 @@
 // ignore_for_file: deprecated_member_use
 import 'dart:convert';
+import 'dart:async';
 import 'dart:math';
 import 'dart:ui';
 
@@ -9,11 +10,16 @@ import 'package:hive_flutter/hive_flutter.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter/services.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 
 import 'hive_core.dart';
 import 'platform_node.dart';
 import 'secure_file.dart';
 import 'ui/hivenet_ui.dart';
+import 'transfer_experience.dart';
+import 'identity.dart';
 
 const _port = 8765;
 final themeMode = ValueNotifier(ThemeMode.dark);
@@ -100,6 +106,25 @@ ThemeData _theme(Brightness brightness) {
         const TextStyle(fontWeight: FontWeight.w600, fontSize: 11),
       ),
     ),
+    filledButtonTheme: FilledButtonThemeData(
+      style: ButtonStyle(
+        animationDuration: const Duration(milliseconds: 180),
+        elevation: const WidgetStatePropertyAll(1),
+        overlayColor: WidgetStatePropertyAll(kDarkBg.withOpacity(.12)),
+        shape: WidgetStatePropertyAll(
+          RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        ),
+      ),
+    ),
+    outlinedButtonTheme: OutlinedButtonThemeData(
+      style: ButtonStyle(
+        animationDuration: const Duration(milliseconds: 180),
+        overlayColor: WidgetStatePropertyAll(kCyan.withOpacity(.10)),
+        shape: WidgetStatePropertyAll(
+          RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        ),
+      ),
+    ),
     inputDecorationTheme: InputDecorationTheme(
       filled: true,
       fillColor: scheme.surface,
@@ -123,10 +148,14 @@ class Peer {
   final String host;
   String? id;
   int free = 0;
+  int total = 0;
   bool online = false;
   int? latencyMs;
   int successes = 0;
   int failures = 0;
+  String? nickname;
+  String? ownerName;
+  bool trusted = false;
   String get base => 'http://$host:$_port';
   String get key => id ?? host;
   double get reliability => PeerCandidate(
@@ -140,8 +169,13 @@ class Peer {
 
   Map<String, dynamic> toJson() => {
     'host': host,
+    'id': id,
+    'total': total,
     'successes': successes,
     'failures': failures,
+    'nickname': nickname,
+    'ownerName': ownerName,
+    'trusted': trusted,
   };
 }
 
@@ -173,7 +207,75 @@ class ActivityEvent {
   final bool error;
 }
 
+class ReplicaSendResult {
+  const ReplicaSendResult._(this.stored, [this.error]);
+  const ReplicaSendResult.stored() : this._(true);
+  const ReplicaSendResult.failed(String error) : this._(false, error);
+
+  final bool stored;
+  final String? error;
+}
+
+class UploadFailure implements Exception {
+  const UploadFailure(this.stage, this.message, {this.eligibleStoragePeers});
+
+  final TransferStage stage;
+  final String message;
+  final int? eligibleStoragePeers;
+
+  @override
+  String toString() => message;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
+class _RegistrationBackdrop extends StatelessWidget {
+  const _RegistrationBackdrop();
+
+  @override
+  Widget build(BuildContext context) => IgnorePointer(
+    child: DecoratedBox(
+      decoration: const BoxDecoration(
+        gradient: RadialGradient(
+          center: Alignment(0, -0.75),
+          radius: 1.05,
+          colors: [Color(0xff123A3D), Color(0xff071217), kDarkBg],
+          stops: [0, .48, 1],
+        ),
+      ),
+      child: Stack(
+        children: [
+          Positioned(
+            top: -160,
+            right: -110,
+            child: _BackdropGlow(color: kCyan.withOpacity(.14), size: 330),
+          ),
+          Positioned(
+            bottom: -180,
+            left: -110,
+            child: _BackdropGlow(
+              color: const Color(0xff00BFAE).withOpacity(.10),
+              size: 360,
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+class _BackdropGlow extends StatelessWidget {
+  const _BackdropGlow({required this.color, required this.size});
+  final Color color;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    width: size,
+    height: size,
+    decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+  );
+}
+
 // Dashboard widget
 // ─────────────────────────────────────────────────────────────────────────────
 class Dashboard extends StatefulWidget {
@@ -185,6 +287,10 @@ class Dashboard extends StatefulWidget {
 class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
   final picker = ImagePicker();
   final vault = OwnerVault();
+  final identityStore = IdentityStore();
+  final _httpClient = http.Client();
+  final _displayNameController = TextEditingController();
+  final _deviceNicknameController = TextEditingController();
   final ownerRecords = <String, Map<String, dynamic>>{};
   final peers = <Peer>[];
   Box<dynamic>? _webImages;
@@ -194,8 +300,20 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
   final activity = <ActivityEvent>[];
   int tab = 0;
   var nodeId = '';
+  var deviceName = 'This device';
+  HiveProfile? profile;
   var busy = true;
+  bool _isBootstrapping = true;
   var status = 'Starting node...';
+  UploadExperience? uploadExperience;
+  List<IncomingTransfer> incomingTransfers = const [];
+  Timer? _incomingPoll;
+  Timer? _pairPoll;
+  Future<void>? _refreshInFlight;
+  bool _loadingIncomingTransfers = false;
+  late final List<ScrollController> _scrollControllers;
+  int _peerFilter = 0;
+  int _galleryFilter = 0;
 
   // Background gradient animation controller
   late final AnimationController _bgAnimationController;
@@ -212,6 +330,7 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
   @override
   void initState() {
     super.initState();
+    _scrollControllers = List.generate(6, (_) => ScrollController());
     _bgAnimationController = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 8),
@@ -224,14 +343,26 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
       vsync: this,
       duration: const Duration(seconds: 4),
     )..repeat();
-    init().catchError((Object error, StackTrace stack) {
+    _bootstrap();
+    _incomingPoll = Timer.periodic(
+      const Duration(seconds: 3),
+      (_) => _loadIncomingTransfers(),
+    );
+  }
+
+  Future<void> _bootstrap() async {
+    try {
+      await init();
+    } catch (error) {
       if (mounted) {
         setState(() {
           busy = false;
           status = 'Node startup failed: $error';
         });
       }
-    });
+    } finally {
+      if (mounted) setState(() => _isBootstrapping = false);
+    }
   }
 
   @override
@@ -239,6 +370,14 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
     _bgAnimationController.dispose();
     _storageRingCtrl.dispose();
     _routerAnimCtrl.dispose();
+    _incomingPoll?.cancel();
+    _pairPoll?.cancel();
+    _httpClient.close();
+    for (final controller in _scrollControllers) {
+      controller.dispose();
+    }
+    _displayNameController.dispose();
+    _deviceNicknameController.dispose();
     super.dispose();
   }
 
@@ -249,6 +388,16 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
       .replaceAll('=', '');
 
   Future<void> init() async {
+    profile = await identityStore.read();
+    if (profile == null) {
+      if (mounted) {
+        setState(() {
+          busy = false;
+          status = 'Create your local HiveNet profile.';
+        });
+      }
+      return;
+    }
     if (kIsWeb) {
       await Hive.initFlutter();
       _webImages = await Hive.openBox<dynamic>('hivenet_images');
@@ -262,8 +411,12 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
             MapEntry(key as String, Map<String, dynamic>.from(value as Map)),
       ),
     );
-    nodeId = prefs.getString('node') ?? randomId();
+    nodeId = profile!.deviceId;
     await prefs.setString('node', nodeId);
+    // A user-selected nickname is the visible device label; its UUID and
+    // Android-Keystore public key remain the cryptographic identity.
+    deviceName = profile!.deviceNickname;
+    await PlatformNode.devicePublicKey();
     for (final saved
         in (jsonDecode(prefs.getString('peers') ?? '[]') as List)) {
       // Accept the old string-only peer list while retaining real transfer
@@ -273,13 +426,76 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
           : Map<String, dynamic>.from(saved as Map);
       final peer = Peer(data['host'] as String)
         ..successes = (data['successes'] as num?)?.toInt() ?? 0
-        ..failures = (data['failures'] as num?)?.toInt() ?? 0;
-      peers.add(peer);
+        ..failures = (data['failures'] as num?)?.toInt() ?? 0
+        ..id = data['id'] as String?
+        ..total = (data['total'] as num?)?.toInt() ?? 0;
+      peer
+        ..nickname = data['nickname'] as String?
+        ..ownerName = data['ownerName'] as String?
+        ..trusted = data['trusted'] as bool? ?? false;
+      final duplicate = peers.any(
+        (existing) =>
+            existing.host == peer.host ||
+            (peer.id != null && existing.id == peer.id),
+      );
+      if (!duplicate) peers.add(peer);
     }
     // A foreground receiver is native because a Flutter activity may be
     // paused or destroyed while another LAN node uploads a replica.
     await PlatformNode.start(nodeId);
+    await _loadIncomingTransfers();
     await refresh();
+  }
+
+  Future<void> _loadIncomingTransfers() async {
+    if (_loadingIncomingTransfers) return;
+    _loadingIncomingTransfers = true;
+    try {
+      final raw = await PlatformNode.incomingTransfers();
+      final next = raw.map(IncomingTransfer.fromPlatform).toList()
+        ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+      if (!mounted) return;
+      // Avoid rebuilding for an unchanged native receiver snapshot.
+      if (next.length == incomingTransfers.length &&
+          next.every(
+            (item) => incomingTransfers.any(
+              (old) =>
+                  old.id == item.id &&
+                  old.stage == item.stage &&
+                  old.receivedBytes == item.receivedBytes,
+            ),
+          )) {
+        return;
+      }
+      final wasComplete = incomingTransfers
+          .where((e) => e.complete)
+          .map((e) => e.id)
+          .toSet();
+      setState(() => incomingTransfers = next);
+      if (next.any((item) => item.complete && !wasComplete.contains(item.id))) {
+        HapticFeedback.heavyImpact();
+      }
+    } catch (_) {
+      // The foreground service can be restarting; retain the last good state.
+    } finally {
+      _loadingIncomingTransfers = false;
+    }
+  }
+
+  void _setUpload(UploadExperience value) {
+    if (!mounted) return;
+    final prior = uploadExperience?.stage;
+    setState(() {
+      uploadExperience = value;
+      status = value.message;
+    });
+    if (prior != value.stage &&
+        (value.stage == TransferStage.complete ||
+            value.stage == TransferStage.failed)) {
+      HapticFeedback.mediumImpact();
+    } else if (prior != value.stage) {
+      HapticFeedback.selectionClick();
+    }
   }
 
   Future<void> savePeers() async {
@@ -296,9 +512,24 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
   }
 
   Future<http.Response> get(String u) =>
-      http.get(Uri.parse(u)).timeout(const Duration(seconds: 5));
+      _httpClient.get(Uri.parse(u)).timeout(const Duration(seconds: 5));
 
-  Future<void> refresh() async {
+  /// Coalesces pull-to-refresh, startup, and post-upload scans so they do not
+  /// race each other or multiply LAN requests.
+  Future<void> refresh() {
+    final current = _refreshInFlight;
+    if (current != null) return current;
+    late final Future<void> refreshFuture;
+    refreshFuture = _refresh().whenComplete(() {
+      if (identical(_refreshInFlight, refreshFuture)) {
+        _refreshInFlight = null;
+      }
+    });
+    _refreshInFlight = refreshFuture;
+    return refreshFuture;
+  }
+
+  Future<void> _refresh() async {
     if (nodeId.isEmpty) return;
     if (mounted) {
       setState(() {
@@ -317,6 +548,7 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
             p.online = true;
             p.id = j['nodeId'] as String?;
             p.free = (j['freeBytes'] as num?)?.toInt() ?? 0;
+            p.total = (j['totalBytes'] as num?)?.toInt() ?? 0;
             p.latencyMs = clock.elapsedMilliseconds;
           } else {
             p.online = false;
@@ -428,47 +660,395 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
     }
   }
 
-  Future<bool> send(
+  Future<void> _pairNewDevice() async {
+    var ip = await PlatformNode.localIp();
+    if (!mounted) return;
+    if (ip == null || ip.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Connect to a LAN or Wi-Fi network before pairing.'),
+        ),
+      );
+      return;
+    }
+    // Android emulators expose a NAT-only 10.0.2.x address. A phone cannot
+    // route to it, so use the Windows host's Wi-Fi address after port-forwarding.
+    if (ip.startsWith('10.0.2.') || ip.startsWith('10.0.3.')) {
+      final field = TextEditingController();
+      final host = await showDialog<String>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('BlueStacks pairing address'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'BlueStacks uses a private emulator address. Enter this PC’s Wi-Fi IPv4 address after forwarding TCP 8765 to BlueStacks.',
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: field,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(
+                  hintText: 'Example: 10.10.80.89',
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, field.text.trim()),
+              child: const Text('Use address'),
+            ),
+          ],
+        ),
+      );
+      if (host == null || host.isEmpty) return;
+      ip = host;
+    }
+    final publicKey = await PlatformNode.devicePublicKey();
+    final session = await PlatformNode.startPairing({
+      'userId': profile!.userId,
+      'ownerName': profile!.displayName,
+      'deviceId': profile!.deviceId,
+      'deviceName': profile!.deviceNickname,
+      'publicKey': publicKey,
+    });
+    final payload = jsonEncode({
+      'v': 1,
+      'host': ip,
+      'port': _port,
+      'token': session['token'],
+      'expiresAt': session['expiresAt'],
+      'deviceId': profile!.deviceId,
+      'deviceName': profile!.deviceNickname,
+      'publicKey': publicKey,
+    });
+    if (!mounted) return;
+    _pairPoll?.cancel();
+    _pairPoll = Timer.periodic(const Duration(seconds: 2), (_) async {
+      final requests = await PlatformNode.pairingRequests();
+      if (requests.isEmpty || !mounted) return;
+      _pairPoll?.cancel();
+      final request = requests.first;
+      final allow = await showDialog<bool>(
+        context: context,
+        builder: (c) => AlertDialog(
+          title: const Text('Approve new HiveNet device?'),
+          content: Text(
+            '${request['ownerName'] ?? 'Unknown owner'} · ${request['deviceName'] ?? 'Unnamed device'}\n\nThe device supplied a valid signing-key proof for this one-time session.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(c, false),
+              child: const Text('Reject'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(c, true),
+              child: const Text('Approve'),
+            ),
+          ],
+        ),
+      );
+      if (allow == true &&
+          await PlatformNode.approvePairing('${request['deviceId']}')) {
+        final host = request['host']?.toString();
+        if (host != null && !peers.any((peer) => peer.host == host)) {
+          peers.add(
+            Peer(host)
+              ..id = request['deviceId']?.toString()
+              ..nickname = request['deviceName']?.toString()
+              ..ownerName = request['ownerName']?.toString()
+              ..trusted = true,
+          );
+        }
+        await savePeers();
+        await refresh();
+      }
+    });
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: kDarkSurface,
+      builder: (c) => Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'Pair New Device',
+              style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900),
+            ),
+            const SizedBox(height: 10),
+            Text(
+              'Scan this one-time QR from the new HiveNet device. It expires in five minutes.',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white70),
+            ),
+            const SizedBox(height: 20),
+            Container(
+              color: Colors.white,
+              padding: const EdgeInsets.all(12),
+              child: QrImageView(data: payload, size: 250),
+            ),
+            const SizedBox(height: 14),
+            const Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                PulsingDot(color: kCyan),
+                SizedBox(width: 8),
+                Text('Waiting for a signed pairing request…'),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+    _pairPoll?.cancel();
+  }
+
+  Future<void> _scanPairQr() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: kDarkBg,
+      builder: (c) => SizedBox(
+        height: MediaQuery.sizeOf(c).height * .78,
+        child: MobileScanner(
+          onDetect: (capture) async {
+            final raw = capture.barcodes.isEmpty
+                ? null
+                : capture.barcodes.first.rawValue;
+            if (raw == null) return;
+            try {
+              final qr = Map<String, dynamic>.from(jsonDecode(raw) as Map);
+              final host = qr['host'] as String;
+              final port = qr['port'] as int;
+              final token = qr['token'] as String;
+              if ((qr['expiresAt'] as num).toInt() <
+                  DateTime.now().millisecondsSinceEpoch) {
+                throw const FormatException('This pairing QR has expired.');
+              }
+              Navigator.pop(c);
+              final publicKey = await PlatformNode.devicePublicKey();
+              final proof = await PlatformNode.signDeviceProof(
+                '$token|${profile!.deviceId}',
+              );
+              final localIp = await PlatformNode.localIp();
+              final response = await _httpClient
+                  .post(
+                    Uri.parse('http://$host:$port/v1/pair/$token/request'),
+                    headers: {'Content-Type': 'application/json'},
+                    body: jsonEncode({
+                      'deviceId': profile!.deviceId,
+                      'deviceName': profile!.deviceNickname,
+                      'ownerName': profile!.displayName,
+                      'publicKey': publicKey,
+                      'proof': proof,
+                      'host': localIp ?? '',
+                    }),
+                  )
+                  .timeout(const Duration(seconds: 8));
+              if (response.statusCode != 202) {
+                throw Exception(
+                  'Pairing request rejected (${response.statusCode}).',
+                );
+              }
+              if (!mounted) return;
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text(
+                    'Request sent. Approve it on the other device.',
+                  ),
+                ),
+              );
+              for (var attempt = 0; attempt < 30; attempt++) {
+                await Future<void>.delayed(const Duration(seconds: 2));
+                final statusResponse = await _httpClient
+                    .get(
+                      Uri.parse('http://$host:$port/v1/pair/$token/status'),
+                      headers: {'x-hivenet-device-id': profile!.deviceId},
+                    )
+                    .timeout(const Duration(seconds: 5));
+                if (statusResponse.statusCode != 200) continue;
+                final status =
+                    jsonDecode(statusResponse.body) as Map<String, dynamic>;
+                if (status['state'] == 'approved') {
+                  if (!peers.any((peer) => peer.host == host)) {
+                    peers.add(
+                      Peer(host)
+                        ..id = qr['deviceId']?.toString()
+                        ..nickname = qr['deviceName']?.toString()
+                        ..ownerName = (status['owner'] as Map?)?['ownerName']
+                            ?.toString()
+                        ..trusted = true,
+                    );
+                  }
+                  await savePeers();
+                  await refresh();
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text(
+                          'Paired with ${qr['deviceName']} successfully.',
+                        ),
+                      ),
+                    );
+                  }
+                  return;
+                }
+              }
+              throw Exception(
+                'Approval timed out. Keep both devices on the same LAN and try again.',
+              );
+            } catch (e) {
+              if (mounted) {
+                ScaffoldMessenger.of(
+                  context,
+                ).showSnackBar(SnackBar(content: Text('Could not pair: $e')));
+              }
+            }
+          },
+        ),
+      ),
+    );
+  }
+
+  Future<ReplicaSendResult> send(
     Peer peer,
     String id,
-    String name,
+    String originalName,
+    String storedName,
+    int originalBytes,
     EncryptedFile image,
   ) async {
     try {
-      final r = await http
+      final r = await _httpClient
           .put(
             Uri.parse('${peer.base}/v1/files/$id'),
             body: image.ciphertext,
             headers: {
               'Content-Type': 'application/octet-stream',
               'x-hivenet-sha256': id,
-              'x-hivenet-name': 'encrypted-object',
+              // Gallery filename and opaque storage filename are separate.
+              // The receiving node persists only [storedName] to its filesystem.
+              'x-hivenet-name-b64': base64Url.encode(utf8.encode(originalName)),
+              'x-hivenet-stored-name': storedName,
+              'x-hivenet-sender-b64': base64Url.encode(utf8.encode(deviceName)),
               'x-hivenet-mime': 'application/octet-stream',
-              'x-hivenet-original-bytes': '${image.ciphertext.length}',
+              'x-hivenet-original-bytes': '$originalBytes',
               'x-hivenet-delete-token-hash': image.deleteTokenHash,
             },
           )
           .timeout(const Duration(seconds: 15));
-      if (r.statusCode != 201) return false;
+      if (r.statusCode != 201) {
+        String detail = 'Peer returned HTTP ${r.statusCode}.';
+        try {
+          final body = jsonDecode(r.body) as Map<String, dynamic>;
+          detail = body['error']?.toString() ?? detail;
+        } catch (_) {
+          // A non-JSON response still has a useful HTTP status above.
+        }
+        return ReplicaSendResult.failed(detail);
+      }
       final ack = jsonDecode(r.body) as Map<String, dynamic>;
-      return ack['stored'] == true && ack['sha256'] == id;
-    } catch (_) {
-      return false;
+      if (ack['stored'] != true || ack['sha256'] != id) {
+        return const ReplicaSendResult.failed(
+          'The peer acknowledgement did not confirm the expected SHA-256.',
+        );
+      }
+      return const ReplicaSendResult.stored();
+    } on TimeoutException {
+      return const ReplicaSendResult.failed(
+        'Timed out waiting for the storage peer acknowledgement.',
+      );
+    } catch (error) {
+      return ReplicaSendResult.failed('Network transfer failed: $error');
     }
   }
 
   Future<void> upload() async {
     final selected = await picker.pickImage(source: ImageSource.gallery);
     if (selected == null) return;
+    late final Uint8List source;
+    try {
+      source = await selected.readAsBytes();
+    } catch (error) {
+      _setUpload(
+        UploadExperience(
+          stage: TransferStage.failed,
+          failedStage: TransferStage.selected,
+          message: 'The selected image could not be read.',
+          originalName: selected.name,
+          error: 'Image selection failed: $error',
+        ),
+      );
+      return;
+    }
+    var failureStage = TransferStage.selected;
+    String? storedName;
+    String? contentId;
+    var eligibleStoragePeers = 0;
+    List<TransferPeerView> latestPeerViews = const [];
+    _setUpload(
+      UploadExperience(
+        stage: TransferStage.selected,
+        message: 'Preview ready. Preparing this image on your device.',
+        originalName: selected.name,
+        preview: source,
+      ),
+    );
+    // Give the selected state a frame before starting the real CPU work.
+    await Future<void>.delayed(Duration.zero);
     setState(() {
       busy = true;
       status = 'Compressing image...';
     });
     try {
-      final prepared = compressImage(await selected.readAsBytes());
-      setState(() => status = 'Encrypting locally with AES-256-GCM...');
-      final encrypted = await vault.encrypt(prepared.bytes);
+      failureStage = TransferStage.compressing;
+      _setUpload(
+        UploadExperience(
+          stage: TransferStage.compressing,
+          message: 'Compressing image locally.',
+          originalName: selected.name,
+          preview: source,
+        ),
+      );
+      final prepared = await compute<List<int>, CompressedImage>(
+        compressImage,
+        source,
+      );
+      failureStage = TransferStage.encrypting;
+      _setUpload(
+        UploadExperience(
+          stage: TransferStage.encrypting,
+          message: 'Encrypting locally with AES-256-GCM.',
+          originalName: selected.name,
+          preview: source,
+        ),
+      );
+      final encrypted = await vault.encrypt(
+        prepared.bytes,
+        onHashing: () {
+          failureStage = TransferStage.hashing;
+          _setUpload(
+            UploadExperience(
+              stage: TransferStage.hashing,
+              message:
+                  'Generating the SHA-256 identity for the encrypted object.',
+              originalName: selected.name,
+              preview: source,
+            ),
+          );
+        },
+      );
       final id = encrypted.id;
+      contentId = id;
+      storedName = 'encryptedImage_${id.substring(0, 12)}';
       lastCompression =
           '${size(prepared.originalBytes)} → ${size(prepared.bytes.length)} '
           '(${((1 - prepared.ratio) * 100).toStringAsFixed(0)}% smaller, '
@@ -481,48 +1061,189 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
         successes: peer.successes,
         failures: peer.failures,
       );
-      // Router only considers responsive peers with enough real free space.
-      if (selectReplicaPeers(
-            peers,
-            candidate,
-            encrypted.ciphertext.length,
-          ).length !=
-          2) {
-        throw Exception('Exactly two distinct eligible peers are required.');
+      failureStage = TransferStage.discovering;
+      _setUpload(
+        UploadExperience(
+          stage: TransferStage.discovering,
+          message: 'Evaluating live capacity, latency, and verified-transfer history.',
+          originalName: selected.name,
+          storedName: storedName,
+          sha256: id,
+          preview: source,
+        ),
+      );
+      // A local device is never treated as one of its own remote replicas.
+      // Eligibility requires a fresh probe, enough real free space, and a
+      // distinct device identity.
+      failureStage = TransferStage.selecting;
+      final eligible = rankEligibleReplicaPeers(
+        peers.where((peer) => peer.key != nodeId),
+        candidate,
+        encrypted.ciphertext.length,
+      );
+      eligibleStoragePeers = eligible.length;
+      final ranked = eligible.take(2).toList();
+      if (eligibleStoragePeers < 2) {
+        throw UploadFailure(
+          TransferStage.selecting,
+          'Upload blocked — $eligibleStoragePeers of 2 required storage peers available. Connect another online device with enough free space.',
+          eligibleStoragePeers: eligibleStoragePeers,
+        );
       }
-      setState(() => status = 'Replicating to two storage nodes...');
+      List<TransferPeerView> peerViews(
+        List<Peer> selection, {
+        Peer? active,
+        Set<String> verified = const {},
+        Set<String> failed = const {},
+      }) => selection.asMap().entries.map((entry) {
+        final peer = entry.value;
+        final peerStatus = verified.contains(peer.key)
+            ? 'Replica stored and SHA-256 verified'
+            : failed.contains(peer.key)
+            ? 'Transfer failed; no acknowledgement was accepted'
+            : active?.key == peer.key
+            ? 'Network transfer in progress'
+            : 'Queued for verified replication';
+        final peerState = verified.contains(peer.key)
+            ? TransferPeerState.verified
+            : failed.contains(peer.key)
+            ? TransferPeerState.failed
+            : active?.key == peer.key
+            ? TransferPeerState.transferring
+            : TransferPeerState.queued;
+        return TransferPeerView(
+          name: peer.id ?? peer.host,
+          rank: entry.key == 0 ? 'BEST REPLICA' : 'SECOND REPLICA',
+          availableStorage: size(peer.free),
+          latency: '${peer.latencyMs ?? '?'} ms',
+          reliability:
+              '${(peer.reliability * 100).toStringAsFixed(0)}% reliable',
+          status: peerStatus,
+          state: peerState,
+        );
+      }).toList();
+      latestPeerViews = peerViews(ranked);
+      _setUpload(
+        UploadExperience(
+          stage: TransferStage.selecting,
+          message: 'Two distinct storage devices were selected.',
+          originalName: selected.name,
+          storedName: storedName,
+          sha256: id,
+          preview: source,
+          peers: latestPeerViews,
+        ),
+      );
       // A failed top-ranked device is replaced by the next ranked *distinct*
       // peer; a successful transfer is never faked or counted twice.
       final attemptedKeys = <String>{};
       final replicas = <Peer>[];
+      List<Peer> displayPeers(Peer active) {
+        final seen = <String>{};
+        return [
+          ...replicas,
+          active,
+          ...ranked,
+          ...peers,
+        ].where((candidate) => seen.add(candidate.key)).take(2).toList();
+      }
+
       while (replicas.length < 2) {
         final next = selectReplicaPeers(
-          peers.where((peer) => !attemptedKeys.contains(peer.key)),
+          peers.where(
+            (peer) => peer.key != nodeId && !attemptedKeys.contains(peer.key),
+          ),
           candidate,
           encrypted.ciphertext.length,
         );
         if (next.isEmpty) break;
         final peer = next.first;
         attemptedKeys.add(peer.key);
-        if (await send(peer, id, selected.name, encrypted)) {
+        failureStage = TransferStage.sending;
+        latestPeerViews = peerViews(
+          displayPeers(peer),
+          active: peer,
+          verified: replicas.map((item) => item.key).toSet(),
+        );
+        _setUpload(
+          UploadExperience(
+            stage: TransferStage.sending,
+            message: 'Sending encrypted data to ${peer.id ?? peer.host}.',
+            originalName: selected.name,
+            storedName: storedName,
+            sha256: id,
+            preview: source,
+            peers: latestPeerViews,
+          ),
+        );
+        final result = await send(
+          peer,
+          id,
+          selected.name,
+          storedName,
+          prepared.originalBytes,
+          encrypted,
+        );
+        if (result.stored) {
+          failureStage = TransferStage.verifying;
+          latestPeerViews = peerViews(
+            displayPeers(peer),
+            verified: {...replicas.map((item) => item.key), peer.key},
+          );
+          _setUpload(
+            UploadExperience(
+              stage: TransferStage.verifying,
+              message:
+                  '${peer.id ?? peer.host} acknowledged the replica and SHA-256.',
+              originalName: selected.name,
+              storedName: storedName,
+              sha256: id,
+              preview: source,
+              peers: latestPeerViews,
+            ),
+          );
           peer.successes++;
           replicas.add(peer);
         } else {
           peer.failures++;
+          latestPeerViews = peerViews(
+            displayPeers(peer),
+            verified: replicas.map((item) => item.key).toSet(),
+            failed: {peer.key},
+          );
+          _setUpload(
+            UploadExperience(
+              stage: TransferStage.sending,
+              message:
+                  'Transfer to ${peer.id ?? peer.host} failed: ${result.error ?? 'no acknowledgement'}. Trying another eligible peer.',
+              originalName: selected.name,
+              storedName: storedName,
+              sha256: id,
+              preview: source,
+              peers: latestPeerViews,
+            ),
+          );
         }
       }
       await savePeers();
       if (replicas.length != 2) {
+        failureStage = TransferStage.sending;
         log(
           'Replication failed',
           'Two verified replicas were not available.',
           Icons.error_outline,
           error: true,
         );
-        throw Exception('Could not verify two independent replica writes.');
+        throw UploadFailure(
+          TransferStage.sending,
+          'Only ${replicas.length} of 2 remote replicas were verified. No upload was completed.',
+          eligibleStoragePeers: eligibleStoragePeers,
+        );
       }
+      failureStage = TransferStage.verifying;
       ownerRecords[id] = {
         'name': selected.name,
+        'storedName': storedName,
         'nonce': base64Url.encode(encrypted.nonce),
         'bytes': prepared.bytes.length,
         'originalBytes': prepared.originalBytes,
@@ -550,32 +1271,83 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
             content: Text('Replicated and verified on both storage nodes.'),
           ),
         );
+        _setUpload(
+          UploadExperience(
+            stage: TransferStage.complete,
+            message: 'Both independent replicas are stored and verified.',
+            originalName: selected.name,
+            storedName: storedName,
+            sha256: id,
+            preview: source,
+            peers: peerViews(
+              replicas,
+              verified: replicas.map((item) => item.key).toSet(),
+            ),
+          ),
+        );
       }
     } catch (e) {
-      log('Upload failed', '$e', Icons.error_outline, error: true);
+      final failure = e is UploadFailure
+          ? e
+          : UploadFailure(failureStage, 'Upload failed: $e');
+      log('Upload failed', failure.message, Icons.error_outline, error: true);
+      _setUpload(
+        UploadExperience(
+          stage: TransferStage.failed,
+          message: failure.message,
+          originalName: selected.name,
+          storedName: storedName,
+          sha256: contentId,
+          preview: source,
+          peers: latestPeerViews,
+          error: failure.message,
+          failedStage: failure.stage,
+          eligibleStoragePeers:
+              failure.eligibleStoragePeers ?? eligibleStoragePeers,
+        ),
+      );
       if (mounted) {
         ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('Upload failed: $e')));
+            .showSnackBar(SnackBar(content: Text(failure.message)));
       }
     }
     await refresh();
   }
 
   Future<void> showImage(Meta m, [Peer? peer]) async {
+    final owner = ownerRecords[m.id];
+    if (owner == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('This encrypted object belongs to another device.'),
+          ),
+        );
+      }
+      return;
+    }
     try {
+      late final Uint8List encrypted;
       if (kIsWeb && peer == null) {
         final record = _webImages!.get(m.id) as Map;
-        final bytes = Uint8List.fromList(
-          List<int>.from(record['bytes'] as List),
+        encrypted = _verifiedBytes(
+          m.id,
+          Uint8List.fromList(List<int>.from(record['bytes'] as List)),
         );
-        if (mounted) await _showImage(m.name, _verifiedBytes(m.id, bytes));
-        return;
+      } else {
+        final r = await get(
+          '${peer?.base ?? 'http://127.0.0.1:$_port'}/v1/files/${m.id}',
+        );
+        if (r.statusCode != 200) throw Exception();
+        encrypted = _verifiedBytes(m.id, r.bodyBytes);
       }
-      final r = await get(
-        '${peer?.base ?? 'http://127.0.0.1:$_port'}/v1/files/${m.id}',
+      final plaintext = await vault.decrypt(
+        m.id,
+        encrypted,
+        base64Url.decode(owner['nonce'] as String),
       );
-      if (r.statusCode != 200) throw Exception();
-      if (mounted) await _showImage(m.name, _verifiedBytes(m.id, r.bodyBytes));
+      if (!mounted) return;
+      await _showImage(owner['name'] as String, plaintext);
     } catch (_) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -703,325 +1475,390 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
   int get onlineCount => peers.where((p) => p.online).length;
   int get pooledFree =>
       peers.where((p) => p.online).fold(0, (n, p) => n + p.free);
+  int get pooledTotal =>
+      peers.where((p) => p.online).fold(0, (n, p) => n + p.total);
+  int get pooledUsed =>
+      (pooledTotal - pooledFree).clamp(0, pooledTotal).toInt();
+
+  /// Every tab owns one primary scrollable. Keeping its controller alive makes
+  /// tab changes feel native while avoiding nested vertical gesture arenas.
+  Widget _tabList({required int index, required List<Widget> children}) {
+    return Scrollbar(
+      controller: _scrollControllers[index],
+      child: ListView(
+        key: PageStorageKey<String>('hivenet-tab-$index'),
+        controller: _scrollControllers[index],
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 124),
+        children: children,
+      ),
+    );
+  }
+
+  Widget _filterChip({
+    required String label,
+    required bool selected,
+    required VoidCallback onSelected,
+  }) {
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    return Padding(
+      padding: const EdgeInsets.only(right: 8),
+      child: ChoiceChip(
+        label: Text(label),
+        selected: selected,
+        onSelected: (_) => onSelected(),
+        showCheckmark: false,
+        labelStyle: TextStyle(
+          color: selected
+              ? kDarkBg
+              : (dark ? Colors.white70 : const Color(0xff20343B)),
+          fontSize: 12,
+          fontWeight: FontWeight.w700,
+        ),
+        selectedColor: kCyan,
+        backgroundColor: dark
+            ? Colors.white.withOpacity(0.055)
+            : kCyan.withOpacity(0.08),
+        side: BorderSide(color: kCyan.withOpacity(selected ? 0 : 0.30)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+      ),
+    );
+  }
 
   // ─── page builders ────────────────────────────────────────────────────────
 
   Widget _home(BuildContext c) {
     final dark = Theme.of(c).brightness == Brightness.dark;
-    return Scaffold(
-      backgroundColor: Colors.transparent,
-      body: Stack(
-        children: [
-          // Pull-to-refresh scroll view
-          CustomScrollView(
-            slivers: [
-              // ── Gradient SliverAppBar ──
-              SliverAppBar(
-                expandedHeight: 220,
-                pinned: true,
-                backgroundColor: Colors.transparent,
-                elevation: 0,
-                actions: [
-                  IconButton(
-                    onPressed: busy ? null : refresh,
-                    tooltip: 'Refresh network',
-                    icon: const Icon(Icons.refresh, color: Colors.white),
-                  ),
-                  IconButton(
-                    onPressed: busy ? null : upload,
-                    tooltip: 'Encrypt and upload image',
-                    icon: const Icon(Icons.upload_rounded, color: Colors.white),
-                  ),
-                  IconButton(
-                    onPressed: addPeer,
-                    tooltip: 'Add LAN peer',
-                    icon: const Icon(Icons.add_link, color: Colors.white),
-                  ),
-                ],
-                flexibleSpace: FlexibleSpaceBar(
-                  titlePadding: const EdgeInsets.only(left: 20, bottom: 16),
-                  title: const Text(
-                    'HiveNet',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.w900,
-                      fontSize: 26,
-                      letterSpacing: 1.5,
-                    ),
-                  ),
-                  background: Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      // Gradient background
-                      Container(
-                        decoration: const BoxDecoration(
-                          gradient: LinearGradient(
-                            begin: Alignment.topLeft,
-                            end: Alignment.bottomRight,
-                            colors: [Color(0xff172832), Color(0xff0E1A21)],
-                          ),
-                        ),
-                      ),
-                      // Honeycomb decoration via CustomPaint
-                      Positioned.fill(
-                        child: CustomPaint(painter: _HoneycombPainter()),
-                      ),
-                      // Bottom blur fade
-                      Positioned(
-                        bottom: 0,
-                        left: 0,
-                        right: 0,
-                        height: 60,
-                        child: Container(
-                          decoration: BoxDecoration(
-                            gradient: LinearGradient(
-                              begin: Alignment.topCenter,
-                              end: Alignment.bottomCenter,
-                              colors: [
-                                Colors.transparent,
-                                (dark ? kDarkBg : const Color(0xffEEECFF))
-                                    .withOpacity(0.7),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
-                    ],
+    return Stack(
+      children: [
+        // Pull-to-refresh scroll view
+        CustomScrollView(
+          key: const PageStorageKey<String>('hivenet-tab-0'),
+          controller: _scrollControllers[0],
+          physics: const AlwaysScrollableScrollPhysics(),
+          slivers: [
+            // ── Gradient SliverAppBar ──
+            SliverAppBar(
+              expandedHeight: 220,
+              pinned: true,
+              backgroundColor: Colors.transparent,
+              elevation: 0,
+              actions: [
+                IconButton(
+                  onPressed: busy ? null : refresh,
+                  tooltip: 'Refresh network',
+                  icon: const Icon(Icons.refresh, color: Colors.white),
+                ),
+                IconButton(
+                  onPressed: busy ? null : upload,
+                  tooltip: 'Encrypt and upload image',
+                  icon: const Icon(Icons.upload_rounded, color: Colors.white),
+                ),
+                IconButton(
+                  onPressed: addPeer,
+                  tooltip: 'Add LAN peer',
+                  icon: const Icon(Icons.add_link, color: Colors.white),
+                ),
+              ],
+              flexibleSpace: FlexibleSpaceBar(
+                titlePadding: const EdgeInsets.only(left: 20, bottom: 16),
+                title: const Text(
+                  'HiveNet',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w900,
+                    fontSize: 26,
+                    letterSpacing: 1.5,
                   ),
                 ),
-              ),
-
-              SliverPadding(
-                padding: const EdgeInsets.fromLTRB(16, 0, 16, 120),
-                sliver: SliverList(
-                  delegate: SliverChildListDelegate([
-                    const SizedBox(height: 8),
-
-                    // ── Node info card ──
-                    GlassCard(
-                      glowColor: kPurple,
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            children: [
-                              ShaderMask(
-                                shaderCallback: (b) => const LinearGradient(
-                                  colors: [kPurple, kCyan],
-                                ).createShader(b),
-                                child: const Text(
-                                  'THIS DEVICE',
-                                  style: TextStyle(
-                                    fontWeight: FontWeight.w900,
-                                    fontSize: 12,
-                                    color: Colors.white,
-                                    letterSpacing: 1.8,
-                                  ),
-                                ),
-                              ),
-                              const Spacer(),
-                              AnimatedStatusPill(
-                                online: !busy,
-                                label: busy ? 'Syncing' : 'Live',
-                              ),
+                background: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    // Gradient background
+                    Container(
+                      decoration: const BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: [Color(0xff172832), Color(0xff0E1A21)],
+                        ),
+                      ),
+                    ),
+                    // Honeycomb decoration via CustomPaint
+                    Positioned.fill(
+                      child: CustomPaint(painter: _HoneycombPainter()),
+                    ),
+                    // Bottom blur fade
+                    Positioned(
+                      bottom: 0,
+                      left: 0,
+                      right: 0,
+                      height: 60,
+                      child: Container(
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                            colors: [
+                              Colors.transparent,
+                              (dark ? kDarkBg : const Color(0xffEEECFF))
+                                  .withOpacity(0.7),
                             ],
                           ),
-                          const SizedBox(height: 10),
-                          SelectableText(
-                            nodeId,
-                            style: TextStyle(
-                              fontFamily: 'monospace',
-                              fontSize: 11,
-                              color: dark ? Colors.white70 : Colors.black54,
-                            ),
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            status,
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: dark ? kCyan : kPurple,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                          Text(
-                            PlatformNode.receiverDescription,
-                            style: TextStyle(
-                              fontSize: 11,
-                              color: dark ? Colors.white54 : Colors.black45,
-                            ),
-                          ),
-                        ],
+                        ),
                       ),
                     ),
-                    const SizedBox(height: 16),
+                  ],
+                ),
+              ),
+            ),
 
-                    // ── Metric cards row ──
-                    SizedBox(
-                      width: double.infinity,
-                      child: NeonButton(
-                        label: busy
-                            ? 'Preparing secure upload…'
-                            : 'Encrypt & Upload Image',
-                        icon: Icons.upload_rounded,
-                        onPressed: busy ? null : upload,
-                        colors: const [kCyan, kCyan],
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                    SizedBox(
-                      height: 120,
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: GradientMetricCard(
-                              icon: Icons.storage_outlined,
-                              value: size(pooledFree),
-                              label: 'Pooled storage',
-                              colors: const [kPurple, kPink],
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: GradientMetricCard(
-                              icon: Icons.devices_outlined,
-                              value: '$onlineCount/${peers.length}',
-                              label: 'Peers online',
-                              colors: const [kCyan, kPurple],
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: GradientMetricCard(
-                              icon: Icons.photo_library_outlined,
-                              value: '${gallery.length}',
-                              label: 'Gallery items',
-                              colors: const [kPink, kAmber],
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(height: 8),
+            SliverPadding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 120),
+              sliver: SliverList(
+                delegate: SliverChildListDelegate([
+                  const SizedBox(height: 8),
 
-                    // ── Peers section ──
-                    NeonSectionTitle(
-                      'Peers ($onlineCount/${peers.length} online)',
-                      color: kCyan,
-                    ),
-                    ...peers.asMap().entries.map(
-                      (entry) => _animatedPeerCard(c, entry.value, entry.key),
-                    ),
-                    if (peers.isEmpty)
-                      GlassCard(
-                        child: Text(
-                          'No peers yet. Tap + to add a LAN peer.',
+                  // ── Node info card ──
+                  GlassCard(
+                    glowColor: kPurple,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Row(
+                                children: [
+                                  const Icon(Icons.hive_outlined, color: kCyan),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: Text(
+                                      deviceName,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.w900,
+                                        fontSize: 16,
+                                        letterSpacing: 0.2,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            AnimatedStatusPill(
+                              online: !busy,
+                              label: busy ? 'Syncing' : 'Live',
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                        SelectableText(
+                          nodeId,
                           style: TextStyle(
+                            fontFamily: 'monospace',
+                            fontSize: 11,
+                            color: dark ? Colors.white70 : Colors.black54,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          status,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: dark ? kCyan : kPurple,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        Text(
+                          PlatformNode.receiverDescription,
+                          style: TextStyle(
+                            fontSize: 11,
                             color: dark ? Colors.white54 : Colors.black45,
                           ),
                         ),
-                      ),
-
-                    // ── Distributed gallery ──
-                    NeonSectionTitle(
-                      'Distributed Gallery (${gallery.length})',
-                      color: kPink,
+                      ],
                     ),
-                    if (gallery.isEmpty)
-                      GlassCard(
-                        glowColor: kPink,
-                        child: Row(
-                          children: [
-                            const Icon(Icons.cloud_outlined, color: kPink),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              child: Text(
-                                'No distributed images yet.',
-                                style: TextStyle(
-                                  color: dark ? Colors.white60 : Colors.black54,
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                      )
-                    else
-                      ...gallery.map((entry) => _encryptedImageBar(c, entry)),
-
-                    // ── Local gallery ──
-                    NeonSectionTitle(
-                      'Local Replicas (${images.length})',
-                      color: kAmber,
-                    ),
-                    if (images.isEmpty)
-                      GlassCard(
-                        glowColor: kAmber,
-                        child: const Text(
-                          'No local replicas yet. This device becomes a '
-                          'replica when another device uploads.',
-                        ),
-                      )
-                    else
-                      ...images.map(
-                        (m) => Padding(
-                          padding: const EdgeInsets.only(bottom: 10),
-                          child: GlassCard(
-                            glowColor: kAmber,
-                            child: ListTile(
-                              contentPadding: EdgeInsets.zero,
-                              leading: Container(
-                                width: 42,
-                                height: 42,
-                                decoration: BoxDecoration(
-                                  gradient: const LinearGradient(
-                                    colors: [kAmber, kPink],
-                                  ),
-                                  borderRadius: BorderRadius.circular(12),
-                                ),
-                                child: const Icon(
-                                  Icons.image_outlined,
-                                  color: Colors.white,
-                                  size: 20,
-                                ),
-                              ),
-                              title: Text(m.name),
-                              subtitle: Text(
-                                '${size(m.bytes)} · ${m.id.substring(0, 10)}…',
-                              ),
-                              onTap: () => showImage(m),
+                  ),
+                  if (incomingTransfers.isNotEmpty) ...[
+                    NeonSectionTitle('Incoming replicas', color: kAmber),
+                    ...incomingTransfers
+                        .take(3)
+                        .map(
+                          (transfer) => Padding(
+                            padding: const EdgeInsets.only(bottom: 10),
+                            child: IncomingTransferCard(
+                              transfer: transfer,
+                              formatSize: size,
                             ),
                           ),
                         ),
-                      ),
+                  ],
+                  const SizedBox(height: 16),
 
-                    if (lastCompression != null) ...[
-                      const SizedBox(height: 8),
-                      GlassCard(
-                        glowColor: kGreen,
-                        child: Row(
-                          children: [
-                            const Icon(Icons.compress, color: kGreen, size: 18),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: Text(
-                                'Last upload: $lastCompression',
-                                style: const TextStyle(fontSize: 12),
-                              ),
-                            ),
-                          ],
+                  // ── Metric cards row ──
+                  SizedBox(
+                    width: double.infinity,
+                    child: NeonButton(
+                      label: busy
+                          ? 'Preparing secure upload…'
+                          : 'Encrypt & Upload Image',
+                      icon: Icons.upload_rounded,
+                      onPressed: busy ? null : upload,
+                      colors: const [kCyan, kCyan],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  SizedBox(
+                    height: 120,
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: GradientMetricCard(
+                            icon: Icons.storage_outlined,
+                            value: size(pooledFree),
+                            label: 'Pooled storage',
+                            colors: const [kPurple, kPink],
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: GradientMetricCard(
+                            icon: Icons.devices_outlined,
+                            value: '$onlineCount/${peers.length}',
+                            label: 'Peers online',
+                            colors: const [kCyan, kPurple],
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: GradientMetricCard(
+                            icon: Icons.photo_library_outlined,
+                            value: '${gallery.length}',
+                            label: 'Gallery items',
+                            colors: const [kPink, kAmber],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+
+                  // ── Peers section ──
+                  NeonSectionTitle(
+                    'Peers ($onlineCount/${peers.length} online)',
+                    color: kCyan,
+                  ),
+                  ...peers.asMap().entries.map(
+                    (entry) => _animatedPeerCard(c, entry.value, entry.key),
+                  ),
+                  if (peers.isEmpty)
+                    GlassCard(
+                      child: Text(
+                        'No peers yet. Tap + to add a LAN peer.',
+                        style: TextStyle(
+                          color: dark ? Colors.white54 : Colors.black45,
                         ),
                       ),
-                    ],
-                  ]),
-                ),
-              ),
-            ],
-          ),
+                    ),
 
-          // ── Upload busy overlay ──
-          if (busy) _uploadOverlay(c),
-        ],
-      ),
+                  // ── Distributed gallery ──
+                  NeonSectionTitle(
+                    'Distributed Gallery (${gallery.length})',
+                    color: kPink,
+                  ),
+                  if (gallery.isEmpty)
+                    GlassCard(
+                      glowColor: kPink,
+                      child: Row(
+                        children: [
+                          const Icon(Icons.cloud_outlined, color: kPink),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              'No distributed images yet.',
+                              style: TextStyle(
+                                color: dark ? Colors.white60 : Colors.black54,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    )
+                  else
+                    ...gallery.map((entry) => _encryptedImageBar(c, entry)),
+
+                  // ── Local gallery ──
+                  NeonSectionTitle(
+                    'Local Replicas (${images.length})',
+                    color: kAmber,
+                  ),
+                  if (images.isEmpty)
+                    GlassCard(
+                      glowColor: kAmber,
+                      child: const Text(
+                        'No local replicas yet. This device becomes a '
+                        'replica when another device uploads.',
+                      ),
+                    )
+                  else
+                    ...images.map(
+                      (m) => Padding(
+                        padding: const EdgeInsets.only(bottom: 10),
+                        child: GlassCard(
+                          glowColor: kAmber,
+                          child: ListTile(
+                            contentPadding: EdgeInsets.zero,
+                            leading: Container(
+                              width: 42,
+                              height: 42,
+                              decoration: BoxDecoration(
+                                gradient: const LinearGradient(
+                                  colors: [kAmber, kPink],
+                                ),
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                              child: const Icon(
+                                Icons.image_outlined,
+                                color: Colors.white,
+                                size: 20,
+                              ),
+                            ),
+                            title: Text(m.name),
+                            subtitle: Text(
+                              '${size(m.bytes)} · ${m.id.substring(0, 10)}…',
+                            ),
+                            onTap: () => showImage(m),
+                          ),
+                        ),
+                      ),
+                    ),
+
+                  if (lastCompression != null) ...[
+                    const SizedBox(height: 8),
+                    GlassCard(
+                      glowColor: kGreen,
+                      child: Row(
+                        children: [
+                          const Icon(Icons.compress, color: kGreen, size: 18),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'Last upload: $lastCompression',
+                              style: const TextStyle(fontSize: 12),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ]),
+              ),
+            ),
+          ],
+        ),
+      ],
 
       // ── Upload FAB ──
     );
@@ -1159,18 +1996,34 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
     );
   }
 
-  /// Full-screen upload overlay with HiveUploadAnimation
+  /// Full-screen, event-driven upload experience.
   Widget _uploadOverlay(BuildContext c) {
-    return AnimatedOpacity(
-      duration: const Duration(milliseconds: 300),
-      opacity: busy ? 1.0 : 0.0,
-      child: IgnorePointer(
-        ignoring: !busy,
-        child: Container(
-          color: Colors.black.withOpacity(0.75),
-          child: Center(child: HiveUploadAnimation(statusText: status)),
-        ),
-      ),
+    final experience = uploadExperience!;
+    return TransferExperienceSheet(
+      key: ValueKey('${experience.stage}-${experience.message}'),
+      experience: experience,
+      formatSize: size,
+      onClose: experience.isFinished
+          ? () => setState(() => uploadExperience = null)
+          : null,
+      onRetry: experience.stage == TransferStage.failed
+          ? () {
+              setState(() => uploadExperience = null);
+              upload();
+            }
+          : null,
+      onScanQr: experience.failedStage == TransferStage.selecting
+          ? () async {
+              setState(() => uploadExperience = null);
+              await _scanPairQr();
+            }
+          : null,
+      onAddPeer: experience.failedStage == TransferStage.selecting
+          ? () async {
+              setState(() => uploadExperience = null);
+              await _pairNewDevice();
+            }
+          : null,
     );
   }
 
@@ -1178,12 +2031,15 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
 
   Widget _storage(BuildContext c) {
     final totalFree = pooledFree;
-    // Use a heuristic fraction for the ring (at most 0.85 for display)
-    final usedFraction = peers.isEmpty ? 0.0 : 0.38.clamp(0.0, 0.85);
+    final totalCapacity = pooledTotal;
+    final usedCapacity = pooledUsed;
+    final usedFraction = totalCapacity == 0
+        ? 0.0
+        : (usedCapacity / totalCapacity).clamp(0.0, 1.0);
     final dark = Theme.of(c).brightness == Brightness.dark;
 
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 0, 16, 120),
+    return _tabList(
+      index: 1,
       children: [
         const SizedBox(height: 16),
         NeonSectionTitle('Storage', color: kPurple),
@@ -1233,9 +2089,9 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
               Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  _legendDot(kPurple, 'Used'),
+                  _legendDot(kPurple, 'Used ${size(usedCapacity)}'),
                   const SizedBox(width: 20),
-                  _legendDot(kCyan, 'Free'),
+                  _legendDot(kCyan, 'Free ${size(totalFree)}'),
                 ],
               ),
             ],
@@ -1315,8 +2171,13 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
 
   Widget _peers(BuildContext c) {
     final dark = Theme.of(c).brightness == Brightness.dark;
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 0, 16, 120),
+    final visiblePeers = peers.where((peer) {
+      return _peerFilter == 0 ||
+          (_peerFilter == 1 && peer.online) ||
+          (_peerFilter == 2 && !peer.online);
+    }).toList();
+    return _tabList(
+      index: 2,
       children: [
         const SizedBox(height: 16),
         NeonSectionTitle('Peers', color: kCyan),
@@ -1328,7 +2189,74 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
           ),
         ),
         const SizedBox(height: 12),
-        ...peers.asMap().entries.map((entry) {
+        Wrap(
+          children: [
+            _filterChip(
+              label: 'All (${peers.length})',
+              selected: _peerFilter == 0,
+              onSelected: () => setState(() => _peerFilter = 0),
+            ),
+            _filterChip(
+              label: 'Online ($onlineCount)',
+              selected: _peerFilter == 1,
+              onSelected: () => setState(() => _peerFilter = 1),
+            ),
+            _filterChip(
+              label: 'Offline (${peers.length - onlineCount})',
+              selected: _peerFilter == 2,
+              onSelected: () => setState(() => _peerFilter = 2),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            Expanded(
+              child: NeonButton(
+                label: 'Scan QR',
+                icon: Icons.qr_code_scanner_rounded,
+                colors: const [kCyan, kGreen],
+                onPressed: _scanPairQr,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: _pairNewDevice,
+                icon: const Icon(Icons.add_link_rounded),
+                label: const Text('Pair device'),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 16),
+        if (visiblePeers.isEmpty)
+          GlassCard(
+            glowColor: kCyan,
+            child: Column(
+              children: [
+                const Icon(
+                  Icons.devices_other_outlined,
+                  color: kCyan,
+                  size: 42,
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  peers.isEmpty
+                      ? 'No peers connected yet.'
+                      : 'No ${_peerFilter == 1 ? 'online' : 'offline'} peers.',
+                  style: const TextStyle(fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 5),
+                const Text(
+                  'Scan a device QR code or create a one-time pairing QR to join your HiveNet.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Colors.white60, fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+        ...visiblePeers.asMap().entries.map((entry) {
           final p = entry.value;
           final reliability = p.reliability;
           return Padding(
@@ -1437,8 +2365,12 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
   // ─── gallery page ─────────────────────────────────────────────────────────
 
   Widget _gallery(BuildContext c) {
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 0, 16, 120),
+    // The current protocol stores encrypted JPEG replicas only. The category
+    // controls are still useful as the app grows, but never invent media that
+    // the network has not actually reported.
+    final visibleGallery = _galleryFilter < 2 ? gallery : <GalleryImage>[];
+    return _tabList(
+      index: 3,
       children: [
         const SizedBox(height: 16),
         NeonSectionTitle('Gallery', color: kPink),
@@ -1447,24 +2379,77 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
           'Previews stay private; only verified metadata is shown here.',
         ),
         const SizedBox(height: 12),
-        if (gallery.isEmpty)
+        Wrap(
+          children: [
+            _filterChip(
+              label: 'All (${gallery.length})',
+              selected: _galleryFilter == 0,
+              onSelected: () => setState(() => _galleryFilter = 0),
+            ),
+            _filterChip(
+              label: 'Images (${gallery.length})',
+              selected: _galleryFilter == 1,
+              onSelected: () => setState(() => _galleryFilter = 1),
+            ),
+            _filterChip(
+              label: 'Videos',
+              selected: _galleryFilter == 2,
+              onSelected: () => setState(() => _galleryFilter = 2),
+            ),
+            _filterChip(
+              label: 'Other',
+              selected: _galleryFilter == 3,
+              onSelected: () => setState(() => _galleryFilter = 3),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        SizedBox(
+          width: double.infinity,
+          child: NeonButton(
+            label: busy ? 'Preparing secure upload…' : 'Upload & Share',
+            icon: Icons.upload_rounded,
+            colors: const [kCyan, kGreen],
+            onPressed: busy ? null : upload,
+          ),
+        ),
+        const SizedBox(height: 14),
+        if (visibleGallery.isEmpty)
           GlassCard(
             glowColor: kPink,
-            child: const Center(
+            child: Center(
               child: Padding(
                 padding: EdgeInsets.all(32),
                 child: Column(
                   children: [
-                    Icon(Icons.photo_library_outlined, color: kPink, size: 48),
-                    SizedBox(height: 12),
-                    Text('No distributed images yet.'),
+                    Icon(
+                      _galleryFilter > 1
+                          ? Icons.video_library_outlined
+                          : Icons.photo_library_outlined,
+                      color: kPink,
+                      size: 48,
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      _galleryFilter > 1
+                          ? 'No ${_galleryFilter == 2 ? 'videos' : 'other files'} are stored.'
+                          : 'No distributed images yet.',
+                    ),
+                    if (_galleryFilter > 1) ...[
+                      const SizedBox(height: 6),
+                      const Text(
+                        'HiveNet currently replicates encrypted image files.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: Colors.white60, fontSize: 12),
+                      ),
+                    ],
                   ],
                 ),
               ),
             ),
           )
         else
-          ...gallery.map((entry) => _encryptedImageBar(c, entry)),
+          ...visibleGallery.map((entry) => _encryptedImageBar(c, entry)),
         /* Legacy thumbnail grid, deliberately not used for encrypted files.
             shrinkWrap: true,
             physics: const NeverScrollableScrollPhysics(),
@@ -1545,8 +2530,8 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
     );
     final dark = Theme.of(c).brightness == Brightness.dark;
 
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 0, 16, 120),
+    return _tabList(
+      index: 4,
       children: [
         const SizedBox(height: 16),
         NeonSectionTitle('Smart Router', color: kAmber),
@@ -1704,11 +2689,74 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
   // ─── settings page ────────────────────────────────────────────────────────
 
   Widget _settings(BuildContext c) {
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 0, 16, 120),
+    return _tabList(
+      index: 5,
       children: [
         const SizedBox(height: 16),
         NeonSectionTitle('Settings', color: kPurple),
+
+        GlassCard(
+          glowColor: kCyan,
+          child: ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.account_circle_rounded, color: kCyan),
+            title: Text(
+              profile!.displayName,
+              style: const TextStyle(fontWeight: FontWeight.w800),
+            ),
+            subtitle: Text(
+              '${profile!.deviceNickname}\nDevice ${profile!.deviceId.substring(0, 8)}… · Android Keystore key',
+            ),
+            isThreeLine: true,
+          ),
+        ),
+        const SizedBox(height: 10),
+
+        GlassCard(
+          glowColor: kGreen,
+          child: ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.devices_other_rounded, color: kGreen),
+            title: const Text(
+              'My HiveNet Devices',
+              style: TextStyle(fontWeight: FontWeight.w700),
+            ),
+            subtitle: Text(
+              '${peers.length} known LAN device${peers.length == 1 ? '' : 's'} · trust is not granted by a display name',
+            ),
+            onTap: () => setState(() => _tab = 2),
+          ),
+        ),
+        const SizedBox(height: 10),
+
+        GlassCard(
+          glowColor: kCyan,
+          child: ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.qr_code_2_rounded, color: kCyan),
+            title: const Text(
+              'Pair New Device',
+              style: TextStyle(fontWeight: FontWeight.w700),
+            ),
+            subtitle: const Text('Generate a five-minute signed pairing QR'),
+            onTap: _pairNewDevice,
+          ),
+        ),
+        const SizedBox(height: 10),
+        GlassCard(
+          glowColor: kAmber,
+          child: ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.qr_code_scanner_rounded, color: kAmber),
+            title: const Text(
+              'Scan QR to Connect',
+              style: TextStyle(fontWeight: FontWeight.w700),
+            ),
+            subtitle: const Text('Connect without typing an IP address'),
+            onTap: _scanPairQr,
+          ),
+        ),
+        const SizedBox(height: 10),
 
         GlassCard(
           glowColor: kPurple,
@@ -1803,13 +2851,191 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
     );
   }
 
+  Widget _onboarding(BuildContext c) {
+    return Scaffold(
+      backgroundColor: kDarkBg,
+      body: Stack(
+        children: [
+          const _RegistrationBackdrop(),
+          Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(20, 32, 20, 28),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 470),
+                child: GlassCard(
+                  padding: const EdgeInsets.fromLTRB(22, 26, 22, 22),
+                  glowColor: kCyan,
+                  borderRadius: 30,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Center(child: RegistrationBrandMark()),
+                      const SizedBox(height: 24),
+                      Center(
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 11,
+                            vertical: 6,
+                          ),
+                          decoration: BoxDecoration(
+                            color: kCyan.withOpacity(.12),
+                            border: Border.all(color: kCyan.withOpacity(.28)),
+                            borderRadius: BorderRadius.circular(999),
+                          ),
+                          child: const Text(
+                            'PRIVATE  •  DISTRIBUTED  •  YOURS',
+                            style: TextStyle(
+                              color: Color(0xff9EF5E9),
+                              fontSize: 10,
+                              fontWeight: FontWeight.w800,
+                              letterSpacing: 1.05,
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 18),
+                      const Text(
+                        'Welcome to HiveNet',
+                        style: TextStyle(
+                          fontSize: 29,
+                          fontWeight: FontWeight.w900,
+                          letterSpacing: -0.8,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        'Create a private identity for your encrypted, device-owned cloud. No email, password, or central account.',
+                        style: TextStyle(height: 1.45, color: Colors.white70),
+                      ),
+                      const SizedBox(height: 24),
+                      AnimatedRegistrationField(
+                        controller: _displayNameController,
+                        labelText: 'Display name',
+                        hintText: 'Rishi',
+                        leadingIcon: Icons.person_outline_rounded,
+                      ),
+                      const SizedBox(height: 12),
+                      AnimatedRegistrationField(
+                        controller: _deviceNicknameController,
+                        labelText: 'This device nickname',
+                        hintText: "Rishi's phone",
+                        leadingIcon: Icons.phone_android_rounded,
+                      ),
+                      const SizedBox(height: 22),
+                      SizedBox(
+                        width: double.infinity,
+                        child: PressScale(
+                          child: FilledButton.icon(
+                            icon: const Icon(Icons.person_add_alt_1_rounded),
+                            label: const Text('Create My Profile'),
+                            onPressed: () async {
+                              if (_displayNameController.text.trim().isEmpty ||
+                                  _deviceNicknameController.text
+                                      .trim()
+                                      .isEmpty) {
+                                ScaffoldMessenger.of(c).showSnackBar(
+                                  const SnackBar(
+                                    content: Text(
+                                      'Enter a display name and device nickname.',
+                                    ),
+                                  ),
+                                );
+                                return;
+                              }
+                              final created = await identityStore.create(
+                                displayName: _displayNameController.text,
+                                deviceNickname: _deviceNicknameController.text,
+                              );
+                              if (!mounted) return;
+                              setState(() {
+                                profile = created;
+                                busy = true;
+                              });
+                              await init();
+                            },
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      SizedBox(
+                        width: double.infinity,
+                        child: PressScale(
+                          child: OutlinedButton.icon(
+                            onPressed: () async {
+                              if (_displayNameController.text.trim().isEmpty ||
+                                  _deviceNicknameController.text
+                                      .trim()
+                                      .isEmpty) {
+                                ScaffoldMessenger.of(c).showSnackBar(
+                                  const SnackBar(
+                                    content: Text(
+                                      'Enter your name and this device nickname, then scan the QR.',
+                                    ),
+                                  ),
+                                );
+                                return;
+                              }
+                              final created = await identityStore.create(
+                                displayName: _displayNameController.text,
+                                deviceNickname: _deviceNicknameController.text,
+                              );
+                              if (!mounted) return;
+                              setState(() {
+                                profile = created;
+                                busy = true;
+                              });
+                              await init();
+                              await _scanPairQr();
+                            },
+                            icon: const Icon(Icons.qr_code_scanner_rounded),
+                            label: const Text('Connect Existing Device'),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      const Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Icon(
+                            Icons.verified_user_outlined,
+                            size: 16,
+                            color: kCyan,
+                          ),
+                          SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'Protected by an Android-Keystore signing key. Your private key never leaves this device.',
+                              style: TextStyle(
+                                fontSize: 12,
+                                height: 1.35,
+                                color: Colors.white60,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   // ─── _tab variable + build ────────────────────────────────────────────────
 
   int _tab = 0;
 
   @override
   Widget build(BuildContext c) {
+    if (_isBootstrapping) return const HiveNetworkSplashScreen();
+    if (profile == null) return _onboarding(c);
     final dark = Theme.of(c).brightness == Brightness.dark;
+    final bottomInset = MediaQuery.paddingOf(c).bottom;
+    final compactNavigation = MediaQuery.sizeOf(c).width < 390;
 
     final pages = [
       _home(c),
@@ -1880,13 +3106,16 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
           ),
 
           // ── Page content with animated tab switch ──
-          TabTransitionWrapper(tabIndex: _tab, child: pages[_tab]),
+          SafeArea(
+            bottom: false,
+            child: TabTransitionWrapper(tabIndex: _tab, child: pages[_tab]),
+          ),
 
           // ── Floating frosted glass navigation bar ──
           Positioned(
-            bottom: 16,
-            left: 16,
-            right: 16,
+            bottom: bottomInset + 8,
+            left: 12,
+            right: 12,
             child: ClipRRect(
               borderRadius: BorderRadius.circular(28),
               child: BackdropFilter(
@@ -1913,72 +3142,84 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
                   ),
                   child: Padding(
                     padding: const EdgeInsets.symmetric(
-                      horizontal: 8,
-                      vertical: 9,
+                      horizontal: 4,
+                      vertical: 7,
                     ),
                     child: Row(
                       mainAxisAlignment: MainAxisAlignment.spaceAround,
                       children: List.generate(6, (i) {
                         final selected = _tab == i;
-                        return GestureDetector(
-                          onTap: () => setState(() => _tab = i),
-                          child: AnimatedContainer(
-                            duration: const Duration(milliseconds: 250),
-                            curve: Curves.easeOutCubic,
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 10,
-                              vertical: 8,
-                            ),
-                            decoration: BoxDecoration(
-                              borderRadius: BorderRadius.circular(18),
-                              color: selected
-                                  ? kCyan.withOpacity(dark ? 0.24 : 0.14)
-                                  : Colors.transparent,
-                              border: selected
-                                  ? Border.all(
-                                      color: kCyan.withOpacity(
-                                        dark ? 0.52 : 0.34,
-                                      ),
-                                    )
-                                  : null,
-                              boxShadow: selected
-                                  ? [
-                                      BoxShadow(
-                                        color: kCyan.withOpacity(0.18),
-                                        blurRadius: 12,
-                                        spreadRadius: -4,
-                                      ),
-                                    ]
-                                  : [],
-                            ),
-                            child: Column(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(
-                                  selected ? selectedIcons[i] : icons[i],
-                                  color: selected
-                                      ? kCyan
-                                      : (dark
-                                            ? Colors.white70
-                                            : Colors.black54),
-                                  size: 24,
-                                ),
-                                const SizedBox(height: 3),
-                                Text(
-                                  labels[i],
-                                  style: TextStyle(
-                                    fontSize: 10,
-                                    fontWeight: selected
-                                        ? FontWeight.w700
-                                        : FontWeight.w500,
+                        return Expanded(
+                          child: Semantics(
+                            button: true,
+                            selected: selected,
+                            label: labels[i],
+                            child: PressScale(
+                              child: GestureDetector(
+                                behavior: HitTestBehavior.opaque,
+                                onTap: () => setState(() => _tab = i),
+                                child: AnimatedContainer(
+                                  duration: const Duration(milliseconds: 250),
+                                  curve: Curves.easeOutCubic,
+                                  padding: EdgeInsets.symmetric(
+                                    horizontal: compactNavigation ? 2 : 5,
+                                    vertical: 7,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    borderRadius: BorderRadius.circular(18),
                                     color: selected
-                                        ? kCyan
-                                        : (dark
-                                              ? Colors.white70
-                                              : Colors.black54),
+                                        ? kCyan.withOpacity(dark ? 0.24 : 0.14)
+                                        : Colors.transparent,
+                                    border: selected
+                                        ? Border.all(
+                                            color: kCyan.withOpacity(
+                                              dark ? 0.52 : 0.34,
+                                            ),
+                                          )
+                                        : null,
+                                    boxShadow: selected
+                                        ? [
+                                            BoxShadow(
+                                              color: kCyan.withOpacity(0.18),
+                                              blurRadius: 12,
+                                              spreadRadius: -4,
+                                            ),
+                                          ]
+                                        : [],
+                                  ),
+                                  child: Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(
+                                        selected ? selectedIcons[i] : icons[i],
+                                        color: selected
+                                            ? kCyan
+                                            : (dark
+                                                  ? Colors.white70
+                                                  : Colors.black54),
+                                        size: compactNavigation ? 21 : 23,
+                                      ),
+                                      const SizedBox(height: 3),
+                                      Text(
+                                        labels[i],
+                                        style: TextStyle(
+                                          fontSize: compactNavigation
+                                              ? 8.5
+                                              : 9.5,
+                                          fontWeight: selected
+                                              ? FontWeight.w700
+                                              : FontWeight.w500,
+                                          color: selected
+                                              ? kCyan
+                                              : (dark
+                                                    ? Colors.white70
+                                                    : Colors.black54),
+                                        ),
+                                      ),
+                                    ],
                                   ),
                                 ),
-                              ],
+                              ),
                             ),
                           ),
                         );
@@ -1989,6 +3230,10 @@ class _DashboardState extends State<Dashboard> with TickerProviderStateMixin {
               ),
             ),
           ),
+          // This must be painted above the persistent navigation. Otherwise
+          // the last recovery action in a failed upload is covered on phones.
+          if (uploadExperience != null)
+            Positioned.fill(child: _uploadOverlay(c)),
         ],
       ),
     );

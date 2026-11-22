@@ -82,8 +82,10 @@ class PeerCandidate {
   }
 }
 
-/// Selects exactly two *distinct* devices. It never falls back to broadcast.
-List<T> selectReplicaPeers<T>(
+/// Ranks each distinct peer that is currently usable for a replica. A peer is
+/// eligible only after its live probe reports enough space; display names and
+/// stale telemetry do not make a device eligible.
+List<T> rankEligibleReplicaPeers<T>(
   Iterable<T> peers,
   PeerCandidate Function(T peer) candidate,
   int bytes,
@@ -101,5 +103,12 @@ List<T> selectReplicaPeers<T>(
               : aCandidate.key.compareTo(bCandidate.key);
         });
   final used = <String>{};
-  return ranked.where((peer) => used.add(candidate(peer).key)).take(2).toList();
+  return ranked.where((peer) => used.add(candidate(peer).key)).toList();
 }
+
+/// Selects exactly two *distinct* devices. It never falls back to broadcast.
+List<T> selectReplicaPeers<T>(
+  Iterable<T> peers,
+  PeerCandidate Function(T peer) candidate,
+  int bytes,
+) => rankEligibleReplicaPeers(peers, candidate, bytes).take(2).toList();

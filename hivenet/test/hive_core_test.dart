@@ -63,4 +63,74 @@ void main() {
     final selected = selectReplicaPeers(peers, (peer) => peer, 1024);
     expect(selected.map((peer) => peer.key), ['a', 'b']);
   });
+
+  test('router reports the actual number of distinct eligible peers', () {
+    const uploadBytes = 2048;
+    PeerCandidate peer(
+      String key, {
+      required bool online,
+      required int freeBytes,
+    }) => PeerCandidate(
+      key: key,
+      online: online,
+      freeBytes: freeBytes,
+      latencyMs: 10,
+      successes: 1,
+      failures: 0,
+    );
+
+    expect(
+      rankEligibleReplicaPeers<PeerCandidate>(
+        const [],
+        (candidate) => candidate,
+        uploadBytes,
+      ),
+      isEmpty,
+    );
+
+    final one = [peer('one', online: true, freeBytes: 4096)];
+    expect(
+      rankEligibleReplicaPeers(one, (candidate) => candidate, uploadBytes),
+      hasLength(1),
+    );
+    expect(
+      selectReplicaPeers(one, (candidate) => candidate, uploadBytes),
+      hasLength(1),
+    );
+
+    final two = [
+      peer('one', online: true, freeBytes: 4096),
+      peer('two', online: true, freeBytes: 4096),
+    ];
+    expect(
+      selectReplicaPeers(two, (candidate) => candidate, uploadBytes),
+      hasLength(2),
+    );
+
+    final manyWithDuplicatesAndUnavailable = [
+      ...two,
+      peer('two', online: true, freeBytes: 8192),
+      peer('offline', online: false, freeBytes: 8192),
+      peer('full', online: true, freeBytes: 1),
+      peer('three', online: true, freeBytes: 8192),
+    ];
+    final eligible = rankEligibleReplicaPeers(
+      manyWithDuplicatesAndUnavailable,
+      (candidate) => candidate,
+      uploadBytes,
+    );
+    expect(
+      eligible.map((candidate) => candidate.key),
+      containsAll(['one', 'two', 'three']),
+    );
+    expect(eligible.where((candidate) => candidate.key == 'two'), hasLength(1));
+    expect(
+      selectReplicaPeers(
+        manyWithDuplicatesAndUnavailable,
+        (candidate) => candidate,
+        uploadBytes,
+      ),
+      hasLength(2),
+    );
+  });
 }
