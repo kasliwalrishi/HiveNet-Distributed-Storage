@@ -20,6 +20,10 @@ enum TransferStage {
   failed,
 }
 
+enum UploadStageState { pending, inProgress, completed, failed, skipped }
+
+enum TransferPeerState { queued, transferring, verified, failed }
+
 class TransferPeerView {
   const TransferPeerView({
     required this.name,
@@ -28,6 +32,7 @@ class TransferPeerView {
     required this.latency,
     required this.reliability,
     required this.status,
+    required this.state,
   });
 
   final String name;
@@ -36,6 +41,7 @@ class TransferPeerView {
   final String latency;
   final String reliability;
   final String status;
+  final TransferPeerState state;
 }
 
 class UploadExperience {
@@ -48,6 +54,9 @@ class UploadExperience {
     this.preview,
     this.peers = const [],
     this.error,
+    this.failedStage,
+    this.eligibleStoragePeers,
+    this.requiredStoragePeers = 2,
   });
 
   final TransferStage stage;
@@ -58,9 +67,31 @@ class UploadExperience {
   final Uint8List? preview;
   final List<TransferPeerView> peers;
   final String? error;
+  final TransferStage? failedStage;
+  final int? eligibleStoragePeers;
+  final int requiredStoragePeers;
 
   bool get isFinished =>
       stage == TransferStage.complete || stage == TransferStage.failed;
+
+  /// A failure must not be interpreted as a completed final stage. The UI uses
+  /// the operation that actually failed to render completed, failed, and
+  /// skipped work independently.
+  UploadStageState stateFor(TransferStage target) {
+    if (stage == TransferStage.complete) {
+      return UploadStageState.completed;
+    }
+    if (stage == TransferStage.failed) {
+      final failedAt = failedStage ?? TransferStage.selecting;
+      if (target == failedAt) return UploadStageState.failed;
+      return target.index < failedAt.index
+          ? UploadStageState.completed
+          : UploadStageState.skipped;
+    }
+    if (target.index < stage.index) return UploadStageState.completed;
+    if (target == stage) return UploadStageState.inProgress;
+    return UploadStageState.pending;
+  }
 }
 
 class IncomingTransfer {
@@ -114,12 +145,16 @@ class TransferExperienceSheet extends StatefulWidget {
     required this.formatSize,
     this.onRetry,
     this.onClose,
+    this.onAddPeer,
+    this.onScanQr,
   });
 
   final UploadExperience experience;
   final String Function(int) formatSize;
   final VoidCallback? onRetry;
   final VoidCallback? onClose;
+  final VoidCallback? onAddPeer;
+  final VoidCallback? onScanQr;
 
   @override
   State<TransferExperienceSheet> createState() =>
@@ -158,112 +193,161 @@ class _TransferExperienceSheetState extends State<TransferExperienceSheet>
     return Material(
       color: Colors.black.withOpacity(.78),
       child: SafeArea(
-        child: Center(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 620, maxHeight: 820),
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.all(20),
-              child: GlassCard(
-                glowColor: color,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        _stageIcon(value.stage, color),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                _title(value.stage),
-                                style: const TextStyle(
-                                  fontSize: 20,
-                                  fontWeight: FontWeight.w900,
+        child: LayoutBuilder(
+          builder: (context, constraints) => Center(
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxWidth: 620,
+                maxHeight: constraints.maxHeight < 820
+                    ? constraints.maxHeight
+                    : 820,
+              ),
+              child: SingleChildScrollView(
+                // The final recovery action stays reachable above every phone
+                // gesture area, even when the transfer details are long.
+                padding: const EdgeInsets.fromLTRB(20, 20, 20, 72),
+                child: GlassCard(
+                  glowColor: color,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          _stageIcon(value.stage, color),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  _title(value.stage),
+                                  style: const TextStyle(
+                                    fontSize: 20,
+                                    fontWeight: FontWeight.w900,
+                                  ),
                                 ),
-                              ),
-                              const SizedBox(height: 2),
-                              Text(
-                                value.message,
-                                style: const TextStyle(color: Colors.white70),
-                              ),
-                            ],
+                                const SizedBox(height: 2),
+                                Text(
+                                  value.message,
+                                  style: const TextStyle(color: Colors.white70),
+                                ),
+                              ],
+                            ),
+                          ),
+                          if (value.isFinished)
+                            IconButton(
+                              onPressed: widget.onClose,
+                              icon: const Icon(Icons.close_rounded),
+                            ),
+                        ],
+                      ),
+                      const SizedBox(height: 18),
+                      _VisualRoute(
+                        animation: _motion,
+                        peers: value.peers,
+                        stage: value.stage,
+                        preview: value.preview,
+                      ),
+                      const SizedBox(height: 18),
+                      if (value.preview != null)
+                        _fileRow(
+                          Icons.image_outlined,
+                          'Original',
+                          value.originalName ?? 'Selected image',
+                        ),
+                      if (value.storedName != null)
+                        _fileRow(
+                          Icons.lock_outline_rounded,
+                          'Stored as',
+                          value.storedName!,
+                        ),
+                      if (value.sha256 != null)
+                        _fileRow(
+                          Icons.fingerprint_rounded,
+                          'SHA-256',
+                          '${value.sha256!.substring(0, 16)}…',
+                        ),
+                      const SizedBox(height: 8),
+                      ...TransferStage.values
+                          .where((stage) => stage != TransferStage.failed)
+                          .take(8)
+                          .map((stage) => _stageRow(stage, value)),
+                      if (value.peers.isNotEmpty) ...[
+                        const SizedBox(height: 14),
+                        const Text(
+                          'SELECTED STORAGE DEVICES',
+                          style: TextStyle(
+                            color: kCyan,
+                            fontSize: 11,
+                            fontWeight: FontWeight.w900,
+                            letterSpacing: 1.1,
                           ),
                         ),
-                        if (value.isFinished)
-                          IconButton(
-                            onPressed: widget.onClose,
-                            icon: const Icon(Icons.close_rounded),
+                        const SizedBox(height: 8),
+                        ...value.peers.map(_peerCard),
+                      ],
+                      if (failed)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 14),
+                          child: Text(
+                            value.error ??
+                                'The transfer could not be completed.',
+                            style: const TextStyle(
+                              color: kRed,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                      if (failed &&
+                          value.failedStage == TransferStage.selecting) ...[
+                        const SizedBox(height: 14),
+                        _replicaRequirement(value),
+                        if (widget.onAddPeer != null || widget.onScanQr != null)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 12),
+                            child: Row(
+                              children: [
+                                if (widget.onScanQr != null)
+                                  Expanded(
+                                    child: FilledButton.icon(
+                                      onPressed: widget.onScanQr,
+                                      icon: const Icon(
+                                        Icons.qr_code_scanner_rounded,
+                                      ),
+                                      label: const Text('Scan QR'),
+                                    ),
+                                  ),
+                                if (widget.onScanQr != null &&
+                                    widget.onAddPeer != null)
+                                  const SizedBox(width: 10),
+                                if (widget.onAddPeer != null)
+                                  Expanded(
+                                    child: OutlinedButton.icon(
+                                      onPressed: widget.onAddPeer,
+                                      icon: const Icon(Icons.add_link_rounded),
+                                      label: const Text('Add peer'),
+                                    ),
+                                  ),
+                              ],
+                            ),
                           ),
                       ],
-                    ),
-                    const SizedBox(height: 18),
-                    _VisualRoute(
-                      animation: _motion,
-                      peers: value.peers,
-                      stage: value.stage,
-                      preview: value.preview,
-                    ),
-                    const SizedBox(height: 18),
-                    if (value.preview != null)
-                      _fileRow(
-                        Icons.image_outlined,
-                        'Original',
-                        value.originalName ?? 'Selected image',
-                      ),
-                    if (value.storedName != null)
-                      _fileRow(
-                        Icons.lock_outline_rounded,
-                        'Stored as',
-                        value.storedName!,
-                      ),
-                    if (value.sha256 != null)
-                      _fileRow(
-                        Icons.fingerprint_rounded,
-                        'SHA-256',
-                        '${value.sha256!.substring(0, 16)}…',
-                      ),
-                    const SizedBox(height: 8),
-                    ...TransferStage.values
-                        .where((stage) => stage != TransferStage.failed)
-                        .take(8)
-                        .map((stage) => _stageRow(stage, value.stage)),
-                    if (value.peers.isNotEmpty) ...[
-                      const SizedBox(height: 14),
-                      const Text(
-                        'SELECTED STORAGE DEVICES',
-                        style: TextStyle(
-                          color: kCyan,
-                          fontSize: 11,
-                          fontWeight: FontWeight.w900,
-                          letterSpacing: 1.1,
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      ...value.peers.map(_peerCard),
-                    ],
-                    if (failed)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 14),
-                        child: Text(
-                          value.error ?? 'The transfer could not be completed.',
-                          style: const TextStyle(
-                            color: kRed,
-                            fontWeight: FontWeight.w700,
+                      if (failed && widget.onRetry != null)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 14),
+                          child: SizedBox(
+                            width: double.infinity,
+                            child: PressScale(
+                              child: FilledButton.icon(
+                                onPressed: widget.onRetry,
+                                icon: const Icon(Icons.refresh_rounded),
+                                label: const Text('Choose another image'),
+                              ),
+                            ),
                           ),
                         ),
-                      ),
-                    if (failed && widget.onRetry != null)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 14),
-                        child: FilledButton.icon(
-                          onPressed: widget.onRetry,
-                          icon: const Icon(Icons.refresh_rounded),
-                          label: const Text('Choose another image'),
-                        ),
-                      ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -322,34 +406,58 @@ class _TransferExperienceSheetState extends State<TransferExperienceSheet>
     ),
   );
 
-  Widget _stageRow(TransferStage target, TransferStage current) {
-    final done =
-        current.index > target.index || current == TransferStage.complete;
-    final active = current == target;
-    final color = done
-        ? kGreen
-        : active
-        ? kCyan
-        : Colors.white24;
+  Widget _replicaRequirement(UploadExperience value) {
+    final eligible = value.eligibleStoragePeers ?? 0;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: kAmber.withOpacity(.12),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: kAmber.withOpacity(.35)),
+      ),
+      child: Text(
+        '$eligible of ${value.requiredStoragePeers} required storage peers available. Connect another eligible device before uploading.',
+        style: const TextStyle(color: kAmber, fontWeight: FontWeight.w700),
+      ),
+    );
+  }
+
+  Widget _stageRow(TransferStage target, UploadExperience value) {
+    final state = value.stateFor(target);
+    final color = switch (state) {
+      UploadStageState.completed => kGreen,
+      UploadStageState.inProgress => kCyan,
+      UploadStageState.failed => kRed,
+      UploadStageState.skipped => Colors.white38,
+      UploadStageState.pending => Colors.white24,
+    };
+    final icon = switch (state) {
+      UploadStageState.completed => Icons.check_circle_rounded,
+      UploadStageState.inProgress => Icons.radio_button_checked_rounded,
+      UploadStageState.failed => Icons.cancel_rounded,
+      UploadStageState.skipped => Icons.remove_circle_outline_rounded,
+      UploadStageState.pending => Icons.circle_outlined,
+    };
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Row(
         children: [
-          Icon(
-            done
-                ? Icons.check_circle_rounded
-                : active
-                ? Icons.radio_button_checked_rounded
-                : Icons.circle_outlined,
-            size: 17,
-            color: color,
-          ),
+          Icon(icon, size: 17, color: color),
           const SizedBox(width: 10),
           Text(
-            _title(target),
+            '${_title(target)}${state == UploadStageState.skipped ? ' — skipped' : ''}',
             style: TextStyle(
-              color: done || active ? Colors.white : Colors.white54,
-              fontWeight: active ? FontWeight.w800 : FontWeight.w500,
+              color:
+                  state == UploadStageState.pending ||
+                      state == UploadStageState.skipped
+                  ? Colors.white54
+                  : Colors.white,
+              fontWeight:
+                  state == UploadStageState.inProgress ||
+                      state == UploadStageState.failed
+                  ? FontWeight.w800
+                  : FontWeight.w500,
             ),
           ),
         ],
@@ -357,52 +465,60 @@ class _TransferExperienceSheetState extends State<TransferExperienceSheet>
     );
   }
 
-  Widget _peerCard(TransferPeerView peer) => Container(
-    margin: const EdgeInsets.only(bottom: 8),
-    padding: const EdgeInsets.all(11),
-    decoration: BoxDecoration(
-      color: Colors.white.withOpacity(.055),
-      borderRadius: BorderRadius.circular(15),
-      border: Border.all(color: kCyan.withOpacity(.18)),
-    ),
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            Expanded(
-              child: Text(
-                peer.name,
-                style: const TextStyle(fontWeight: FontWeight.w800),
+  Widget _peerCard(TransferPeerView peer) {
+    final color = switch (peer.state) {
+      TransferPeerState.verified => kGreen,
+      TransferPeerState.failed => kRed,
+      TransferPeerState.transferring => kCyan,
+      TransferPeerState.queued => Colors.white60,
+    };
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(11),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(.055),
+        borderRadius: BorderRadius.circular(15),
+        border: Border.all(color: color.withOpacity(.28)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  peer.name,
+                  style: const TextStyle(fontWeight: FontWeight.w800),
+                ),
               ),
-            ),
-            Text(
-              peer.rank,
-              style: const TextStyle(
-                color: kCyan,
-                fontSize: 11,
-                fontWeight: FontWeight.w800,
+              Text(
+                peer.rank,
+                style: const TextStyle(
+                  color: kCyan,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w800,
+                ),
               ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 5),
-        Text(
-          '${peer.availableStorage} free  •  ${peer.latency}  •  ${peer.reliability}',
-          style: const TextStyle(color: Colors.white60, fontSize: 12),
-        ),
-        const SizedBox(height: 6),
-        Text(
-          peer.status,
-          style: const TextStyle(
-            color: kGreen,
-            fontSize: 12,
-            fontWeight: FontWeight.w700,
+            ],
           ),
-        ),
-      ],
-    ),
-  );
+          const SizedBox(height: 5),
+          Text(
+            '${peer.availableStorage} free  •  ${peer.latency}  •  ${peer.reliability}',
+            style: const TextStyle(color: Colors.white60, fontSize: 12),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            peer.status,
+            style: TextStyle(
+              color: color,
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class _VisualRoute extends StatelessWidget {

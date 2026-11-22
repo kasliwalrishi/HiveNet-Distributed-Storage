@@ -30,4 +30,26 @@ class PlatformNode {
     if (!Platform.isAndroid) return 'This device';
     return await _channel.invokeMethod<String>('deviceName') ?? 'This device';
   }
+
+  static Future<String> devicePublicKey() =>
+      _channel.invokeMethod<String>('devicePublicKey').then((value) => value!);
+  static Future<String> signDeviceProof(String payload) => _channel
+      .invokeMethod<String>('signDeviceProof', {'payload': payload})
+      .then((value) => value!);
+  static Future<String?> localIp() => _channel.invokeMethod<String>('localIp');
+  static Future<Map<dynamic, dynamic>> startPairing(
+    Map<String, dynamic> owner,
+  ) => _channel
+      .invokeMethod<Map<dynamic, dynamic>>('startPairing', {'owner': owner})
+      .then((value) => value!);
+  static Future<List<Map<dynamic, dynamic>>> pairingRequests() async =>
+      (await _channel.invokeMethod<List<dynamic>>('pairingRequests'))
+          ?.map((e) => Map<dynamic, dynamic>.from(e as Map))
+          .toList() ??
+      const [];
+  static Future<bool> approvePairing(String deviceId) async =>
+      await _channel.invokeMethod<bool>('approvePairing', {
+        'deviceId': deviceId,
+      }) ??
+      false;
 }

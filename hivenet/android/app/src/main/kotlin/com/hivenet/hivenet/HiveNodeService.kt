@@ -7,7 +7,6 @@ import android.content.Intent
 import android.content.Context
 import android.os.Build
 import android.os.IBinder
-import android.util.Base64
 import androidx.core.app.NotificationCompat
 import org.json.JSONArray
 import org.json.JSONObject
@@ -16,6 +15,10 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.URLDecoder
 import java.security.MessageDigest
+import java.security.KeyFactory
+import java.security.Signature
+import java.security.spec.X509EncodedKeySpec
+import android.util.Base64
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -47,6 +50,27 @@ class HiveNodeService : Service() {
                 }
             } catch (_: Exception) { emptyList() }
         }
+        fun startPairing(context: Context, owner: Map<String, Any?>): Map<String, Any?> {
+            val token = Base64.encodeToString(ByteArray(24).also { java.security.SecureRandom().nextBytes(it) }, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+            val session = JSONObject(owner).put("token", token).put("expiresAt", System.currentTimeMillis() + 5 * 60 * 1000L).put("state", "waiting")
+            context.getSharedPreferences("hivenet", Context.MODE_PRIVATE).edit().putString("pairSession", session.toString()).apply()
+            return mapOf("token" to token, "expiresAt" to session.getLong("expiresAt"))
+        }
+        fun pairingRequests(context: Context): List<Map<String, Any?>> {
+            val session = session(context) ?: return emptyList()
+            val pending = session.optJSONObject("pending") ?: return emptyList()
+            return listOf(mapOf("deviceId" to pending.optString("deviceId"), "deviceName" to pending.optString("deviceName"), "ownerName" to pending.optString("ownerName"), "publicKey" to pending.optString("publicKey")))
+        }
+        fun approvePairing(context: Context, deviceId: String): Boolean {
+            val session = session(context) ?: return false
+            val pending = session.optJSONObject("pending") ?: return false
+            if (pending.optString("deviceId") != deviceId || expired(session)) return false
+            session.put("state", "approved").put("approvedDeviceId", deviceId).put("used", true)
+            context.getSharedPreferences("hivenet", Context.MODE_PRIVATE).edit().putString("pairSession", session.toString()).apply()
+            return true
+        }
+        private fun session(context: Context): JSONObject? = try { JSONObject(context.getSharedPreferences("hivenet", Context.MODE_PRIVATE).getString("pairSession", null) ?: return null) } catch (_: Exception) { null }
+        private fun expired(session: JSONObject) = System.currentTimeMillis() > session.optLong("expiresAt")
     }
     private val port = 8765
     @Volatile private var running = false
@@ -104,6 +128,8 @@ class HiveNodeService : Service() {
                 when {
                     request.method == "OPTIONS" -> corsPreflight(output)
                     request.method == "GET" && request.path == "/v1/info" -> info(output)
+                    request.method == "POST" && request.path.startsWith("/v1/pair/") && request.path.endsWith("/request") -> pairRequest(input, output, request, request.path.removePrefix("/v1/pair/").removeSuffix("/request"))
+                    request.method == "GET" && request.path.startsWith("/v1/pair/") && request.path.endsWith("/status") -> pairStatus(output, request, request.path.removePrefix("/v1/pair/").removeSuffix("/status"))
                     request.method == "GET" && request.path == "/v1/files" -> listFiles(output)
                     request.method == "GET" && request.path.startsWith("/v1/files/") && request.path.endsWith("/meta") -> meta(output, idFromPath(request.path))
                     request.method == "GET" && request.path.startsWith("/v1/files/") -> download(output, idFromPath(request.path))
@@ -173,6 +199,33 @@ class HiveNodeService : Service() {
         transfer(id, sender, originalName, storedName, length, length, "Stored Successfully")
         response(out, 201, "application/json", JSONObject().put("stored", true).put("id", id).put("sha256", actual).toString().toByteArray())
     }
+    private fun pairRequest(input: InputStream, out: OutputStream, r: Request, token: String) {
+        val session = session(this) ?: return response(out, 404, "application/json", "{\"error\":\"no pairing session\"}".toByteArray())
+        if (session.optString("token") != token || expired(session) || session.optBoolean("used")) return response(out, 410, "application/json", "{\"error\":\"pairing session expired\"}".toByteArray())
+        val length = r.headers["content-length"]?.toIntOrNull() ?: return response(out, 411, "application/json", ByteArray(0))
+        if (length !in 2..16384) return response(out, 413, "application/json", ByteArray(0))
+        val bytes = input.readNBytes(length); val request = try { JSONObject(String(bytes, Charsets.UTF_8)) } catch (_: Exception) { return response(out, 400, "application/json", "{\"error\":\"invalid pairing request\"}".toByteArray()) }
+        val deviceId = request.optString("deviceId"); val publicKey = request.optString("publicKey"); val proof = request.optString("proof")
+        if (deviceId.isEmpty() || !verifyProof(publicKey, "$token|$deviceId", proof)) return response(out, 401, "application/json", "{\"error\":\"device proof rejected\"}".toByteArray())
+        session.put("pending", request).put("state", "pending")
+        getSharedPreferences("hivenet", MODE_PRIVATE).edit().putString("pairSession", session.toString()).apply()
+        response(out, 202, "application/json", "{\"state\":\"pending_approval\"}".toByteArray())
+    }
+    private fun pairStatus(out: OutputStream, r: Request, token: String) {
+        val session = session(this) ?: return response(out, 404, "application/json", "{\"error\":\"no pairing session\"}".toByteArray())
+        if (session.optString("token") != token || expired(session)) return response(out, 410, "application/json", "{\"state\":\"expired\"}".toByteArray())
+        val requestedId = r.headers["x-hivenet-device-id"] ?: ""
+        if (session.optString("state") == "approved" && session.optString("approvedDeviceId") == requestedId) {
+            val owner = JSONObject(session.toString())
+            owner.remove("pending")
+            owner.remove("token")
+            response(out, 200, "application/json", JSONObject().put("state", "approved").put("owner", owner).toString().toByteArray())
+        } else response(out, 200, "application/json", "{\"state\":\"${session.optString("state", "waiting")}\"}".toByteArray())
+    }
+    private fun verifyProof(publicKey: String, payload: String, proof: String): Boolean = try {
+        val key = KeyFactory.getInstance("EC").generatePublic(X509EncodedKeySpec(Base64.decode(publicKey, Base64.NO_WRAP)))
+        Signature.getInstance("SHA256withECDSA").run { initVerify(key); update(payload.toByteArray(Charsets.UTF_8)); verify(Base64.decode(proof, Base64.NO_WRAP)) }
+    } catch (_: Exception) { false }
     private fun transfer(id: String, sender: String, originalName: String, storedName: String, receivedBytes: Long, totalBytes: Long, stage: String, error: String? = null) {
         val prefs = getSharedPreferences("hivenet", MODE_PRIVATE)
         val events = try { JSONArray(prefs.getString(transferKey, "[]")) } catch (_: Exception) { JSONArray() }
@@ -187,7 +240,7 @@ class HiveNodeService : Service() {
     private fun decodedHeader(encoded: String?, fallback: String): String = try {
         if (encoded == null) URLDecoder.decode(fallback, "UTF-8") else String(Base64.decode(encoded, Base64.URL_SAFE or Base64.NO_WRAP), Charsets.UTF_8)
     } catch (_: Exception) { fallback }
-    private fun info(out: OutputStream) = response(out, 200, "application/json", JSONObject().put("nodeId", nodeId).put("port", port).put("freeBytes", root.usableSpace).toString().toByteArray())
+    private fun info(out: OutputStream) = response(out, 200, "application/json", JSONObject().put("nodeId", nodeId).put("port", port).put("freeBytes", root.usableSpace).put("totalBytes", root.totalSpace).toString().toByteArray())
     private fun listFiles(out: OutputStream) {
         val a = JSONArray(); File(root, "files").listFiles { f -> f.extension == "json" }?.forEach { a.put(JSONObject(it.readText())) }; response(out, 200, "application/json", a.toString().toByteArray())
     }
